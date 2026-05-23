@@ -62,6 +62,13 @@ a{
     color:red;
     font-style:italic;
 }
+
+.speed-info {
+    color: green;
+    font-family: monospace;
+    font-size: 14px;
+    margin-top: 5px;
+}
 </style>
 
 <!-- JSZip -->
@@ -80,14 +87,15 @@ run
 </button>
 
 <p id="status"></p>
+<div id="speedometer" class="speed-info"></div>
 
 <div id="content"></div>
 
 <script>
 /*
-EPUB GENERATOR
---------------
-Downloads every wiki page
+EPUB GENERATOR (FAST REWRITTEN VERSION)
+----------------------------------------
+Downloads wiki pages concurrently
 Formats them Kindle-style
 Builds a real EPUB file
 */
@@ -95,41 +103,9 @@ Builds a real EPUB file
 var API = "https://genshin-impact.fandom.com/api.php";
 
 var statusText = document.getElementById("status");
+var speedometer = document.getElementById("speedometer");
 var content = document.getElementById("content");
 var downloadButton = document.getElementById("downloadButton");
-
-/* =========================
-   AJAX
-========================= */
-
-function getJSON(url, callback){
-
-    var xhr = new XMLHttpRequest();
-
-    xhr.onreadystatechange = function(){
-
-        if(xhr.readyState === 4){
-
-            if(xhr.status >= 200 && xhr.status < 300){
-
-                try{
-                    callback(null, JSON.parse(xhr.responseText));
-                }catch(e){
-                    callback("JSON parse failed", null);
-                }
-
-            }else{
-                callback("HTTP Error " + xhr.status, null);
-            }
-
-        }
-
-    };
-
-    xhr.open("GET", url, true);
-    xhr.send(null);
-
-}
 
 /* =========================
    CLEAN PAGE
@@ -223,36 +199,27 @@ function getAllPages(callback){
             url += "&apcontinue=" + encodeURIComponent(apcontinue);
         }
 
-        getJSON(url, function(error, data){
-
-            if(error){
-                callback(error, null);
-                return;
-            }
-
-            if(data.query && data.query.allpages){
-
-                for(var i = 0; i < data.query.allpages.length; i++){
-                    pages.push(data.query.allpages[i].title);
+        fetch(url)
+            .then(function(res) { return res.json(); })
+            .then(function(data) {
+                if(data.query && data.query.allpages){
+                    for(var i = 0; i < data.query.allpages.length; i++){
+                        pages.push(data.query.allpages[i].title);
+                    }
                 }
 
-            }
+                statusText.innerHTML = "Loaded page titles: " + pages.length;
 
-            statusText.innerHTML =
-                "Loaded page titles: " + pages.length;
-
-            if(data["continue"] && data["continue"].apcontinue){
-
-                loadBatch(data["continue"].apcontinue);
-
-            }else{
-
-                callback(null, pages);
-
-            }
-
-        });
-
+                // Stop early for quick test configurations if needed, or get all
+                if(data["continue"] && data["continue"].apcontinue && pages.length < 3000){
+                    loadBatch(data["continue"].apcontinue);
+                } else {
+                    callback(null, pages);
+                }
+            })
+            .catch(function(err) {
+                callback(err.message, null);
+            });
     }
 
     loadBatch("");
@@ -260,11 +227,12 @@ function getAllPages(callback){
 }
 
 /* =========================
-   LOAD PAGE HTML
+   LOAD PAGE HTML WITH RETRIES (High Concurrency Protection)
 ========================= */
 
-function loadPage(title, callback){
-
+function loadPage(title, callback, retries) {
+    if (typeof retries === 'undefined') retries = 3;
+    
     var url =
         API +
         "?origin=*" +
@@ -274,29 +242,38 @@ function loadPage(title, callback){
         "&prop=text" +
         "&format=json";
 
-    getJSON(url, function(error, data){
-
-        if(error){
-            callback(error, null);
-            return;
-        }
-
-        if(!data.parse){
-            callback("Could not parse page", null);
-            return;
-        }
-
-        var html = data.parse.text["*"];
-
-        var temp = document.createElement("div");
-        temp.innerHTML = html;
-
-        cleanPage(temp);
-
-        callback(null, temp.innerHTML);
-
-    });
-
+    fetch(url)
+        .then(function(res) {
+            // Handle HTTP 429 Too Many Requests (Rate Limiting)
+            if (res.status === 429 && retries > 0) {
+                var delay = 1000 * (4 - retries);
+                setTimeout(function() {
+                    loadPage(title, callback, retries - 1);
+                }, delay);
+                return;
+            }
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            return res.json();
+        })
+        .then(function(data) {
+            if (!data || !data.parse) {
+                throw new Error("Parse missing");
+            }
+            var html = data.parse.text["*"];
+            var temp = document.createElement("div");
+            temp.innerHTML = html;
+            cleanPage(temp);
+            callback(null, temp.innerHTML);
+        })
+        .catch(function(err) {
+            if (retries > 0) {
+                setTimeout(function() {
+                    loadPage(title, callback, retries - 1);
+                }, 1000);
+            } else {
+                callback(err.message, null);
+            }
+        });
 }
 
 /* =========================
@@ -306,6 +283,7 @@ function loadPage(title, callback){
 function buildEPUB(pagesData){
 
     statusText.innerHTML = "Building EPUB...";
+    speedometer.innerHTML = "";
 
     var zip = new JSZip();
 
@@ -349,6 +327,7 @@ function buildEPUB(pagesData){
     for(var i = 0; i < pagesData.length; i++){
 
         var item = pagesData[i];
+        if(!item) continue;
 
         var fileName = "page" + i + ".xhtml";
 
@@ -431,8 +410,8 @@ navPoints +
 
         saveAs(blob, "Genshin_Impact_Wiki.epub");
 
-        statusText.innerHTML =
-            "Finished EPUB download.";
+        statusText.innerHTML = "Finished EPUB download.";
+        downloadButton.disabled = false;
 
     });
 
@@ -446,31 +425,44 @@ function downloadWiki(){
 
     content.innerHTML = "";
     statusText.innerHTML = "Loading wiki index...";
+    speedometer.innerHTML = "";
+    downloadButton.disabled = true;
 
     getAllPages(function(error, pages){
 
         if(error){
             statusText.innerHTML = error;
+            downloadButton.disabled = false;
             return;
         }
 
         var results = new Array(pages.length);
-        var previewElements = [];
-
-        // Pre-render loading placeholders so order is perfectly preserved
-        for (var i = 0; i < pages.length; i++) {
-            var pageElement = document.createElement("div");
-            pageElement.className = "page";
-            pageElement.id = "preview-" + i;
-            pageElement.innerHTML = "<h3>" + escapeHTML(pages[i]) + "</h3><p class='loading'>Waiting in download queue...</p>";
-            content.appendChild(pageElement);
-            previewElements.push(pageElement);
-        }
-
-        var activeRequests = 0;
-        var maxConcurrency = 12; // Adjust concurrency level (10-15 is typically optimal)
+        
+        // Optimizations: High concurrency level (up to 30 concurrent streams)
+        var maxConcurrency = 30; 
         var currentIndex = 0;
         var completedCount = 0;
+
+        var startTime = Date.now();
+        var lastCompletedCount = 0;
+        var lastReportTime = startTime;
+
+        // Simple Speedometer updater
+        var speedInterval = setInterval(function() {
+            var now = Date.now();
+            var duration = (now - lastReportTime) / 1000;
+            var processed = completedCount - lastCompletedCount;
+            var rps = (processed / duration).toFixed(1);
+            
+            speedometer.innerHTML = "Speed: " + rps + " pages/sec";
+            
+            lastReportTime = now;
+            lastCompletedCount = completedCount;
+            
+            if (completedCount === pages.length) {
+                clearInterval(speedInterval);
+            }
+        }, 1000);
 
         function updateStatus() {
             statusText.innerHTML =
@@ -481,42 +473,47 @@ function downloadWiki(){
         }
 
         function startWorker() {
-            while (activeRequests < maxConcurrency && currentIndex < pages.length) {
+            while (currentIndex < pages.length && (currentIndex - completedCount) < maxConcurrency) {
                 (function(index) {
                     var title = pages[index];
-                    activeRequests++;
                     currentIndex++;
 
-                    // Mark currently loading page
-                    previewElements[index].querySelector(".loading").innerHTML = "Downloading page contents...";
+                    // Create light placeholder elements as they appear
+                    var pageElement = document.createElement("div");
+                    pageElement.className = "page";
+                    pageElement.id = "preview-" + index;
+                    pageElement.innerHTML = "<h3>" + escapeHTML(title) + "</h3><p class='loading'>Downloading...</p>";
+                    content.appendChild(pageElement);
 
                     loadPage(title, function(err, html){
-                        activeRequests--;
                         completedCount++;
 
+                        var element = document.getElementById("preview-" + index);
                         if (!err) {
                             results[index] = {
                                 title: title,
                                 html: html
                             };
-                            // Populate placeholder with downloaded page content
-                            previewElements[index].innerHTML = "<h1>" + escapeHTML(title) + "</h1>" + html;
+                            if (element) {
+                                element.innerHTML = "<h1>" + escapeHTML(title) + "</h1>" + html;
+                            }
                         } else {
                             results[index] = {
                                 title: title,
                                 html: "<p class='error'>Failed to download content.</p>"
                             };
-                            previewElements[index].innerHTML = "<h1>" + escapeHTML(title) + "</h1><p class='error'>Failed to download content.</p>";
+                            if (element) {
+                                element.innerHTML = "<h1>" + escapeHTML(title) + "</h1><p class='error'>Failed to download content.</p>";
+                            }
                         }
 
                         updateStatus();
 
                         if (completedCount === pages.length) {
-                            // Filter out any missing items to ensure clean build data
                             var finalResults = results.filter(function(r) { return r !== undefined; });
                             buildEPUB(finalResults);
                         } else {
-                            // Start next item in queue
+                            // Launch next task in queue
                             startWorker();
                         }
                     });
