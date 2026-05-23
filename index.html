@@ -42,7 +42,9 @@ td, th{
 }
 
 img{
-    display:none;
+    max-width: 100%;
+    height: auto;
+    vertical-align: middle;
 }
 
 a{
@@ -236,6 +238,24 @@ clearConsoleBtn.onclick = function() {
 
 function cleanPage(root){
 
+    // Extract real images out of <noscript> blocks first (common in Fandom responsive lazy-loaders)
+    var noscripts = root.getElementsByTagName("noscript");
+    for (var i = noscripts.length - 1; i >= 0; i--) {
+        var noscript = noscripts[i];
+        var contentStr = noscript.textContent || noscript.innerHTML;
+        if (contentStr && contentStr.indexOf("<img") !== -1) {
+            var tempDiv = document.createElement("div");
+            tempDiv.innerHTML = contentStr;
+            var realImg = tempDiv.querySelector("img");
+            if (realImg && noscript.parentNode) {
+                noscript.parentNode.insertBefore(realImg, noscript);
+            }
+        }
+        if (noscript.parentNode) {
+            noscript.parentNode.removeChild(noscript);
+        }
+    }
+
     removeBySelector(root, ".mw-editsection");
     removeBySelector(root, ".toc");
     removeBySelector(root, ".navbox");
@@ -252,7 +272,7 @@ function cleanPage(root){
     removeBySelector(root, ".noprint");
     removeBySelector(root, ".mw-parser-output > aside");
 
-    // Extract item names from images (e.g. ascension items, Mora, etc.) before removing them
+    // Extract item names and reconstruct actual images properly
     var images = root.getElementsByTagName("img");
     var imgList = [];
     for (var i = 0; i < images.length; i++) {
@@ -261,6 +281,10 @@ function cleanPage(root){
 
     for (var i = 0; i < imgList.length; i++) {
         var img = imgList[i];
+        
+        // Bypass referrer security headers that prevent hotlinking Wikia assets
+        img.setAttribute("referrerpolicy", "no-referrer");
+        
         var altText = img.getAttribute("alt") || img.getAttribute("title") || "";
         
         // Clean common Fandom image prefixes and file extensions
@@ -268,15 +292,50 @@ function cleanPage(root){
                          .replace(/\.(png|jpg|jpeg|gif|webp)$/i, "")
                          .trim();
 
-        if (altText && altText !== "") {
-            // Replace the image node with a readable text node
-            var textNode = document.createTextNode(" " + altText + " ");
-            if (img.parentNode) {
-                img.parentNode.insertBefore(textNode, img);
+        // Resolve image source URL (handling Fandom lazy-loading data-src)
+        var src = img.getAttribute("data-src") || img.getAttribute("src") || "";
+        
+        // Clear out responsive attributes that override custom src rules
+        img.removeAttribute("srcset");
+        img.removeAttribute("data-srcset");
+
+        if (src) {
+            // Check if it's a transparent 1x1 base64 lazy placeholder and fallback to data-src if available
+            if (src.indexOf("data:image") === 0 && img.getAttribute("data-src")) {
+                src = img.getAttribute("data-src");
+            }
+
+            // Normalize URLs to fully qualified secure absolute paths
+            if (src.indexOf("//") === 0) {
+                src = "https:" + src;
+            } else if (src.indexOf("/") === 0) {
+                src = "https://genshin-impact.fandom.com" + src;
+            }
+            img.setAttribute("src", src);
+            img.removeAttribute("data-src");
+            
+            // Apply strict dimension scaling on layout
+            img.style.maxWidth = "100%";
+            img.style.height = "auto";
+            img.style.verticalAlign = "middle";
+            img.style.display = "inline-block";
+            
+            // Constrain small item icons so they look inline
+            var widthAttr = img.getAttribute("width");
+            var heightAttr = img.getAttribute("height");
+            if ((widthAttr && parseInt(widthAttr) <= 64) || (heightAttr && parseInt(heightAttr) <= 64) || src.indexOf("scale-to-width-down") !== -1) {
+                img.style.maxHeight = "24px";
+                img.style.width = "auto";
+                img.style.marginRight = "4px";
             }
         }
-        if (img.parentNode) {
-            img.parentNode.removeChild(img);
+
+        if (altText && altText !== "") {
+            // Append a readable text label next to the image as a caption/backup descriptor
+            var textNode = document.createTextNode(" " + altText + " ");
+            if (img.parentNode) {
+                img.parentNode.insertBefore(textNode, img.nextSibling);
+            }
         }
     }
 
@@ -489,7 +548,8 @@ function buildEPUB(pagesData){
         "style.css",
         'body{font-family:serif;line-height:1.5;padding:1em;}' +
         'table{border-collapse:collapse;width:100%;margin-top:10px;margin-bottom:10px;}' +
-        'td,th{border:1px solid black;padding:6px;vertical-align:top;}'
+        'td,th{border:1px solid black;padding:6px;vertical-align:top;}' +
+        'img{max-width:100%;height:auto;vertical-align:middle;display:inline-block;}'
     );
 
     /* Chapters */
@@ -623,9 +683,15 @@ function downloadWiki(){
         
         // Concurrency Tuning: 1000 simultaneous streams
         var maxConcurrency = 1000; 
-        var currentIndex = 0;
         var completedCount = 0;
         var errorCount = 0;
+        var failedIndices = [];
+
+        // Build active worker queue pool
+        var queue = [];
+        for (var i = 0; i < pages.length; i++) {
+            queue.push(i);
+        }
 
         var startTime = Date.now();
         var lastCompletedCount = 0;
@@ -638,7 +704,7 @@ function downloadWiki(){
             var processed = completedCount - lastCompletedCount;
             var rps = (processed / duration).toFixed(1);
             
-            speedometer.innerHTML = "Speed: " + rps + " pages/sec | Active Threads: " + Math.min(maxConcurrency, pages.length - completedCount);
+            speedometer.innerHTML = "Speed: " + rps + " pages/sec | Active Threads: " + Math.min(maxConcurrency, queue.length);
             
             lastReportTime = now;
             lastCompletedCount = completedCount;
@@ -668,6 +734,10 @@ function downloadWiki(){
                 "<div>Active Threads: <span id='dashActive' style='font-weight:bold; color:#1a73e8;'>0</span></div>" +
                 "<div>Failed Pages: <span id='dashErrors' style='font-weight:bold; color:red;'>0</span></div>" +
             "</div>" +
+            "<div id='retryControlsContainer' style='margin-top: 15px; display: none; padding-top: 10px; border-top: 1px solid #eee;'>" +
+                "<button id='retryFailedBtn' style='font-size:13px; padding:6px 12px; background:#f44336; color:white; border:none; border-radius:3px; cursor:pointer; font-weight:bold;'>Retry Failed Pages</button>" +
+                "<button id='forceBuildBtn' style='font-size:13px; padding:6px 12px; margin-left:10px; background:#4caf50; color:white; border:none; border-radius:3px; cursor:pointer; font-weight:bold;'>Build EPUB Anyway</button>" +
+            "</div>" +
             "<h4 style='margin-bottom:6px; margin-top:14px; font-size:13px; color:#555;'>Live Feed (Last 10 Downloads)</h4>" +
             "<div id='liveFeed' style='font-size:12px; font-family:monospace; background:#fff; border:1px solid #eee; padding:8px; height:140px; overflow-y:auto; border-radius:3px;'></div>";
             
@@ -679,6 +749,9 @@ function downloadWiki(){
         var dashActive = document.getElementById("dashActive");
         var dashErrors = document.getElementById("dashErrors");
         var liveFeed = document.getElementById("liveFeed");
+        var retryControlsContainer = document.getElementById("retryControlsContainer");
+        var retryFailedBtn = document.getElementById("retryFailedBtn");
+        var forceBuildBtn = document.getElementById("forceBuildBtn");
 
         dashTotal.textContent = pages.length;
 
@@ -703,7 +776,7 @@ function downloadWiki(){
             var percent = ((completedCount / pages.length) * 100).toFixed(1);
             progressBar.style.width = percent + "%";
             dashDownloaded.textContent = completedCount;
-            dashActive.textContent = Math.min(maxConcurrency, pages.length - completedCount);
+            dashActive.textContent = Math.min(maxConcurrency, queue.length);
             dashErrors.textContent = errorCount;
             
             statusText.innerHTML = "Downloading pages: " + completedCount + " / " + pages.length;
@@ -713,9 +786,9 @@ function downloadWiki(){
 
         // Execution loop runs dynamically without dynamic DOM bloat
         function launchWorker() {
-            if (currentIndex >= pages.length) return;
+            if (queue.length === 0) return;
 
-            var taskIndex = currentIndex++;
+            var taskIndex = queue.shift();
             var title = pages[taskIndex];
 
             loadPage(title, function(err, html) {
@@ -729,6 +802,7 @@ function downloadWiki(){
                     pushToLiveFeed(title, "DONE", taskIndex);
                 } else {
                     errorCount++;
+                    failedIndices.push(taskIndex);
                     results[taskIndex] = {
                         title: title,
                         html: "<p class='error'>Failed to download content.</p>"
@@ -747,17 +821,55 @@ function downloadWiki(){
 
                 if (completedCount === pages.length) {
                     updateUI();
-                    var finalResults = results.filter(function(r) { return r !== undefined; });
-                    logToConsole("All 100% downloads resolved. Compiling ebook archive structure...", "success");
-                    buildEPUB(finalResults);
+                    
+                    if (errorCount > 0) {
+                        logToConsole("Finished downloading with " + errorCount + " unresolved failures.", "warn");
+                        statusText.innerHTML = "Downloads complete with some errors. Choose an action below:";
+                        retryFailedBtn.textContent = "Retry " + errorCount + " Failed Pages";
+                        retryControlsContainer.style.display = "block";
+                    } else {
+                        var finalResults = results.filter(function(r) { return r !== undefined; });
+                        logToConsole("All 100% downloads resolved. Compiling ebook archive structure...", "success");
+                        buildEPUB(finalResults);
+                    }
                 } else {
                     launchWorker();
                 }
             });
         }
 
+        // Retry logic setup
+        retryFailedBtn.onclick = function() {
+            retryControlsContainer.style.display = "none";
+            logToConsole("Retrying " + failedIndices.length + " failed page downloads...", "info");
+
+            // Transfer failures back into the active processing queue
+            queue = failedIndices.slice();
+            
+            // Re-adjust stats down to accommodate the re-queued items
+            completedCount -= failedIndices.length;
+            errorCount = 0;
+            failedIndices = [];
+
+            updateUI();
+
+            // Fire up parallel workers for the retry run
+            var startingRetryWorkers = Math.min(maxConcurrency, queue.length);
+            for (var w = 0; w < startingRetryWorkers; w++) {
+                launchWorker();
+            }
+        };
+
+        // Proceed without retrying logic
+        forceBuildBtn.onclick = function() {
+            retryControlsContainer.style.display = "none";
+            var finalResults = results.filter(function(r) { return r !== undefined; });
+            logToConsole("Forcing build. Compiling EPUB with placeholder blocks for missing pages...", "warn");
+            buildEPUB(finalResults);
+        };
+
         // Boot-up initial optimized streams up to limit
-        var startingWorkersCount = Math.min(maxConcurrency, pages.length);
+        var startingWorkersCount = Math.min(maxConcurrency, queue.length);
         logToConsole("Spinning up " + startingWorkersCount + " parallel workers...", "info");
         for (var w = 0; w < startingWorkersCount; w++) {
             launchWorker();
