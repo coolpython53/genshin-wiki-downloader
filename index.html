@@ -48,11 +48,19 @@ a{
 
 .page{
     margin-top:30px;
+    padding-top:20px;
+    border-top:1px dashed #ccc;
     page-break-after:always;
 }
 
 .loading{
     color:gray;
+    font-style:italic;
+}
+
+.error{
+    color:red;
+    font-style:italic;
 }
 </style>
 
@@ -446,48 +454,78 @@ function downloadWiki(){
             return;
         }
 
-        var results = [];
-        var index = 0;
+        var results = new Array(pages.length);
+        var previewElements = [];
 
-        function nextPage(){
-
-            if(index >= pages.length){
-
-                buildEPUB(results);
-                return;
-
-            }
-
-            var title = pages[index];
-
-            statusText.innerHTML =
-                "Downloading page " +
-                (index + 1) +
-                " / " +
-                pages.length +
-                ": " +
-                escapeHTML(title);
-
-            loadPage(title, function(err, html){
-
-                if(!err){
-
-                    results.push({
-                        title:title,
-                        html:html
-                    });
-
-                }
-
-                index++;
-
-                setTimeout(nextPage, 100);
-
-            });
-
+        // Pre-render loading placeholders so order is perfectly preserved
+        for (var i = 0; i < pages.length; i++) {
+            var pageElement = document.createElement("div");
+            pageElement.className = "page";
+            pageElement.id = "preview-" + i;
+            pageElement.innerHTML = "<h3>" + escapeHTML(pages[i]) + "</h3><p class='loading'>Waiting in download queue...</p>";
+            content.appendChild(pageElement);
+            previewElements.push(pageElement);
         }
 
-        nextPage();
+        var activeRequests = 0;
+        var maxConcurrency = 12; // Adjust concurrency level (10-15 is typically optimal)
+        var currentIndex = 0;
+        var completedCount = 0;
+
+        function updateStatus() {
+            statusText.innerHTML =
+                "Downloading pages: " +
+                completedCount +
+                " / " +
+                pages.length;
+        }
+
+        function startWorker() {
+            while (activeRequests < maxConcurrency && currentIndex < pages.length) {
+                (function(index) {
+                    var title = pages[index];
+                    activeRequests++;
+                    currentIndex++;
+
+                    // Mark currently loading page
+                    previewElements[index].querySelector(".loading").innerHTML = "Downloading page contents...";
+
+                    loadPage(title, function(err, html){
+                        activeRequests--;
+                        completedCount++;
+
+                        if (!err) {
+                            results[index] = {
+                                title: title,
+                                html: html
+                            };
+                            // Populate placeholder with downloaded page content
+                            previewElements[index].innerHTML = "<h1>" + escapeHTML(title) + "</h1>" + html;
+                        } else {
+                            results[index] = {
+                                title: title,
+                                html: "<p class='error'>Failed to download content.</p>"
+                            };
+                            previewElements[index].innerHTML = "<h1>" + escapeHTML(title) + "</h1><p class='error'>Failed to download content.</p>";
+                        }
+
+                        updateStatus();
+
+                        if (completedCount === pages.length) {
+                            // Filter out any missing items to ensure clean build data
+                            var finalResults = results.filter(function(r) { return r !== undefined; });
+                            buildEPUB(finalResults);
+                        } else {
+                            // Start next item in queue
+                            startWorker();
+                        }
+                    });
+                })(currentIndex);
+            }
+        }
+
+        updateStatus();
+        startWorker();
 
     });
 
