@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="en">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
 <title>test</title>
 
@@ -20,20 +20,24 @@ button{
     padding:8px 12px;
     margin:4px;
     font-size:18px;
+    cursor: pointer;
+}
+
+button:disabled {
+    background: #ccc;
+    cursor: not-allowed;
 }
 
 table{
     border-collapse:collapse;
     width:100%;
-    display:block;
-    overflow:auto;
     margin-top:10px;
     margin-bottom:10px;
 }
 
 td, th{
     border:1px solid black;
-    padding:4px;
+    padding:6px;
     vertical-align:top;
 }
 
@@ -47,10 +51,9 @@ a{
 }
 
 .page{
-    margin-top:30px;
-    padding-top:20px;
+    margin-top:15px;
+    padding-top:15px;
     border-top:1px dashed #ccc;
-    page-break-after:always;
 }
 
 .loading{
@@ -68,6 +71,77 @@ a{
     font-family: monospace;
     font-size: 14px;
     margin-top: 5px;
+}
+
+/* Console Styling */
+.console-container {
+    margin-top: 15px;
+    margin-bottom: 15px;
+    border: 1px solid #333;
+    border-radius: 4px;
+    background: #1e1e1e;
+    color: #e0e0e0;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+.console-header {
+    background: #2d2d2d;
+    padding: 6px 10px;
+    border-bottom: 1px solid #333;
+    font-weight: bold;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.console-log {
+    height: 180px;
+    overflow-y: auto;
+    padding: 10px;
+    line-height: 1.4;
+    scroll-behavior: smooth;
+}
+
+.log-item {
+    margin-bottom: 4px;
+    white-space: pre-wrap;
+}
+
+.log-info { color: #8ab4f8; }
+.log-success { color: #b4f8a8; }
+.log-warn { color: #fbe094; }
+.log-error { color: #f8a8a8; }
+
+/* Status Row */
+.status-badge {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 12px;
+    font-family: monospace;
+    margin-left: 10px;
+}
+.badge-pending { background: #f0f0f0; color: #666; }
+.badge-running { background: #e8f0fe; color: #1a73e8; }
+.badge-success { background: #e6f4ea; color: #137333; }
+.badge-error { background: #fce8e6; color: #c5221f; }
+
+.page-title-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+}
+
+.page-preview-content {
+    margin-top: 10px;
+    padding: 10px;
+    background: #fafafa;
+    border: 1px solid #eee;
+    max-height: 300px;
+    overflow-y: auto;
 }
 </style>
 
@@ -89,9 +163,19 @@ run
 <p id="status"></p>
 <div id="speedometer" class="speed-info"></div>
 
+<!-- Custom Logging Console -->
+<div class="console-container">
+    <div class="console-header">
+        <span>Console Logs</span>
+        <button id="clearConsoleBtn" style="font-size: 11px; padding: 2px 6px; margin: 0; background: #444; color: #fff; border: none; border-radius: 2px;">Clear</button>
+    </div>
+    <div id="consoleLog" class="console-log"></div>
+</div>
+
 <div id="content"></div>
 
-<script>
+<script type="text/javascript">
+//<![CDATA[
 /*
 EPUB GENERATOR (FAST REWRITTEN VERSION)
 ----------------------------------------
@@ -106,6 +190,45 @@ var statusText = document.getElementById("status");
 var speedometer = document.getElementById("speedometer");
 var content = document.getElementById("content");
 var downloadButton = document.getElementById("downloadButton");
+var consoleLog = document.getElementById("consoleLog");
+var clearConsoleBtn = document.getElementById("clearConsoleBtn");
+
+// Single global parser instance to prevent memory leaks and GC lag
+var globalDOMParser = new DOMParser();
+
+// Map of lowercased page title -> EPUB filename
+var titleMap = {};
+
+/* =========================
+   LOGGING CONSOLE UTILS
+========================= */
+
+function logToConsole(message, type) {
+    var typeClass = "log-info";
+    if (type === "success") typeClass = "log-success";
+    if (type === "warn") typeClass = "log-warn";
+    if (type === "error") typeClass = "log-error";
+
+    var item = document.createElement("div");
+    item.className = "log-item " + typeClass;
+    
+    var timestamp = new Date().toISOString().split('T')[1].slice(0, -1);
+    item.textContent = "[" + timestamp + "] " + message;
+    
+    consoleLog.appendChild(item);
+    
+    // Prune logs if they get too long to preserve DOM performance
+    if (consoleLog.children.length > 100) {
+        consoleLog.removeChild(consoleLog.firstChild);
+    }
+    
+    // Auto-scroll to bottom
+    consoleLog.scrollTop = consoleLog.scrollHeight;
+}
+
+clearConsoleBtn.onclick = function() {
+    consoleLog.innerHTML = "";
+};
 
 /* =========================
    CLEAN PAGE
@@ -129,10 +252,32 @@ function cleanPage(root){
     removeBySelector(root, ".noprint");
     removeBySelector(root, ".mw-parser-output > aside");
 
+    // Extract item names from images (e.g. ascension items, Mora, etc.) before removing them
     var images = root.getElementsByTagName("img");
+    var imgList = [];
+    for (var i = 0; i < images.length; i++) {
+        imgList.push(images[i]);
+    }
 
-    while(images.length > 0){
-        images[0].parentNode.removeChild(images[0]);
+    for (var i = 0; i < imgList.length; i++) {
+        var img = imgList[i];
+        var altText = img.getAttribute("alt") || img.getAttribute("title") || "";
+        
+        // Clean common Fandom image prefixes and file extensions
+        altText = altText.replace(/^Item\s+/i, "")
+                         .replace(/\.(png|jpg|jpeg|gif|webp)$/i, "")
+                         .trim();
+
+        if (altText && altText !== "") {
+            // Replace the image node with a readable text node
+            var textNode = document.createTextNode(" " + altText + " ");
+            if (img.parentNode) {
+                img.parentNode.insertBefore(textNode, img);
+            }
+        }
+        if (img.parentNode) {
+            img.parentNode.removeChild(img);
+        }
     }
 
     var links = root.getElementsByTagName("a");
@@ -143,15 +288,28 @@ function cleanPage(root){
 
         if(href && href.indexOf("/wiki/") === 0){
 
-            var pageName =
-                decodeURIComponent(
-                    href.replace("/wiki/", "")
-                ).replace(/_/g, " ");
+            // Separate the hash section (sub-anchor) if present
+            var path = href.replace("/wiki/", "");
+            var hashIndex = path.indexOf("#");
+            var pagePart = hashIndex !== -1 ? path.substring(0, hashIndex) : path;
+            var hashPart = hashIndex !== -1 ? path.substring(hashIndex) : "";
 
-            links[i].setAttribute(
-                "href",
-                "#" + encodeURIComponent(pageName)
-            );
+            var pageName = decodeURIComponent(pagePart).replace(/_/g, " ").trim();
+            var lowerPageName = pageName.toLowerCase();
+
+            // Check if page exists in our local compilation
+            if(titleMap && titleMap[lowerPageName]){
+                links[i].setAttribute(
+                    "href",
+                    titleMap[lowerPageName] + hashPart
+                );
+            } else {
+                // If it doesn't exist locally, map to an absolute external web URL so the link remains functional
+                links[i].setAttribute(
+                    "href",
+                    "https://genshin-impact.fandom.com/wiki/" + pagePart + hashPart
+                );
+            }
 
         }
 
@@ -184,6 +342,7 @@ function removeBySelector(root, selector){
 function getAllPages(callback){
 
     var pages = [];
+    logToConsole("Initializing metadata retrieval from Wiki index...", "info");
 
     function loadBatch(apcontinue){
 
@@ -209,15 +368,18 @@ function getAllPages(callback){
                 }
 
                 statusText.innerHTML = "Loaded page titles: " + pages.length;
+                logToConsole("Retrieved title batch. Total so far: " + pages.length, "info");
 
                 // Load batches continuously until apcontinue is no longer returned
                 if(data["continue"] && data["continue"].apcontinue){
                     loadBatch(data["continue"].apcontinue);
                 } else {
+                    logToConsole("Finished index mapping. Total pages to download: " + pages.length, "success");
                     callback(null, pages);
                 }
             })
             .catch(function(err) {
+                logToConsole("Failed to load catalog index: " + err.message, "error");
                 callback(err.message, null);
             });
     }
@@ -244,9 +406,10 @@ function loadPage(title, callback, retries) {
 
     fetch(url)
         .then(function(res) {
-            // Handle HTTP 429 Too Many Requests (Rate Limiting)
+            // Handle HTTP 429 Too Many Requests
             if (res.status === 429 && retries > 0) {
                 var delay = 1000 * (4 - retries);
+                logToConsole("Rate limited (429) on '" + title + "'. Retrying in " + delay + "ms...", "warn");
                 setTimeout(function() {
                     loadPage(title, callback, retries - 1);
                 }, delay);
@@ -260,17 +423,26 @@ function loadPage(title, callback, retries) {
                 throw new Error("Parse missing");
             }
             var html = data.parse.text["*"];
-            var temp = document.createElement("div");
-            temp.innerHTML = html;
-            cleanPage(temp);
-            callback(null, temp.innerHTML);
+            
+            // Clean content asynchronously using single global DOMParser to prevent memory fragmentation
+            var doc = globalDOMParser.parseFromString(html, "text/html");
+            var body = doc.body;
+            cleanPage(body);
+            
+            // Convert clean HTML DOM to strict, well-formed XHTML serialization
+            var serializer = new XMLSerializer();
+            var xhtmlBodyStr = serializer.serializeToString(body);
+            
+            callback(null, xhtmlBodyStr);
         })
         .catch(function(err) {
             if (retries > 0) {
+                logToConsole("Error fetching '" + title + "' (" + err.message + "). Retrying...", "warn");
                 setTimeout(function() {
                     loadPage(title, callback, retries - 1);
                 }, 1000);
             } else {
+                logToConsole("Failed permanently to load '" + title + "'", "error");
                 callback(err.message, null);
             }
         });
@@ -284,6 +456,7 @@ function buildEPUB(pagesData){
 
     statusText.innerHTML = "Building EPUB...";
     speedometer.innerHTML = "";
+    logToConsole("Initializing ZIP generation for " + pagesData.length + " documents...", "info");
 
     var zip = new JSZip();
 
@@ -315,8 +488,8 @@ function buildEPUB(pagesData){
     oebps.file(
         "style.css",
         'body{font-family:serif;line-height:1.5;padding:1em;}' +
-        'table{border-collapse:collapse;width:100%;}' +
-        'td,th{border:1px solid black;padding:4px;}'
+        'table{border-collapse:collapse;width:100%;margin-top:10px;margin-bottom:10px;}' +
+        'td,th{border:1px solid black;padding:6px;vertical-align:top;}'
     );
 
     /* Chapters */
@@ -338,12 +511,7 @@ function buildEPUB(pagesData){
 '<title>' + escapeHTML(item.title) + '</title>' +
 '<link rel="stylesheet" type="text/css" href="style.css"/>' +
 '</head>' +
-'<body>' +
-'<h1 id="' + encodeURIComponent(item.title) + '">' +
-escapeHTML(item.title) +
-'</h1>' +
-item.html +
-'</body>' +
+item.html + // Already wrapped in serialized <body>...</body> via XMLSerializer
 '</html>';
 
         oebps.file(fileName, chapter);
@@ -404,6 +572,8 @@ navPoints +
 '</ncx>'
     );
 
+    logToConsole("Compressing and packing EPUB file... (this may take a few seconds)", "info");
+
     zip.generateAsync({
         type:"blob"
     }).then(function(blob){
@@ -412,7 +582,12 @@ navPoints +
 
         statusText.innerHTML = "Finished EPUB download.";
         downloadButton.disabled = false;
+        logToConsole("EPUB created successfully! Download started.", "success");
 
+    }).catch(function(e) {
+        logToConsole("EPUB compilation error: " + e.message, "error");
+        statusText.innerHTML = "Error generating EPUB.";
+        downloadButton.disabled = false;
     });
 
 }
@@ -427,6 +602,7 @@ function downloadWiki(){
     statusText.innerHTML = "Loading wiki index...";
     speedometer.innerHTML = "";
     downloadButton.disabled = true;
+    logToConsole("Starting download routine...", "info");
 
     getAllPages(function(error, pages){
 
@@ -438,23 +614,31 @@ function downloadWiki(){
 
         var results = new Array(pages.length);
         
-        // Optimizations: High concurrency level (up to 30 concurrent streams)
-        var maxConcurrency = 30; 
+        // Build the local page tracking map
+        titleMap = {};
+        for (var i = 0; i < pages.length; i++) {
+            titleMap[pages[i].toLowerCase().trim()] = "page" + i + ".xhtml";
+        }
+        logToConsole("Generated page-link translation table for EPUB cross-referencing.", "success");
+        
+        // Concurrency Tuning: 1000 simultaneous streams
+        var maxConcurrency = 1000; 
         var currentIndex = 0;
         var completedCount = 0;
+        var errorCount = 0;
 
         var startTime = Date.now();
         var lastCompletedCount = 0;
         var lastReportTime = startTime;
 
-        // Simple Speedometer updater
+        // Speedometer loop
         var speedInterval = setInterval(function() {
             var now = Date.now();
             var duration = (now - lastReportTime) / 1000;
             var processed = completedCount - lastCompletedCount;
             var rps = (processed / duration).toFixed(1);
             
-            speedometer.innerHTML = "Speed: " + rps + " pages/sec";
+            speedometer.innerHTML = "Speed: " + rps + " pages/sec | Active Threads: " + Math.min(maxConcurrency, pages.length - completedCount);
             
             lastReportTime = now;
             lastCompletedCount = completedCount;
@@ -464,66 +648,122 @@ function downloadWiki(){
             }
         }, 1000);
 
-        function updateStatus() {
-            statusText.innerHTML =
-                "Downloading pages: " +
-                completedCount +
-                " / " +
-                pages.length;
-        }
+        // Render highly optimized virtualized Dashboard (O(1) DOM Footprint)
+        var dashboard = document.createElement("div");
+        dashboard.style.padding = "15px";
+        dashboard.style.background = "#fafafa";
+        dashboard.style.border = "1px solid #ddd";
+        dashboard.style.borderRadius = "4px";
+        dashboard.style.marginBottom = "20px";
+        dashboard.style.fontFamily = "sans-serif";
+        
+        dashboard.innerHTML = 
+            "<h3 style='margin-top:0; font-size:16px; color:#333;'>Download Progress Dashboard</h3>" +
+            "<div style='width:100%; background:#e0e0e0; height:12px; border-radius:6px; overflow:hidden; margin-bottom:12px;'>" +
+                "<div id='progressBar' style='width:0%; background:#4caf50; height:100%; transition: width 0.15s ease;'></div>" +
+            "</div>" +
+            "<div style='display:grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size:14px; font-family:monospace;'>" +
+                "<div>Total Catalog: <span id='dashTotal' style='font-weight:bold;'>-</span></div>" +
+                "<div>Downloaded: <span id='dashDownloaded' style='font-weight:bold; color:green;'>0</span></div>" +
+                "<div>Active Threads: <span id='dashActive' style='font-weight:bold; color:#1a73e8;'>0</span></div>" +
+                "<div>Failed Pages: <span id='dashErrors' style='font-weight:bold; color:red;'>0</span></div>" +
+            "</div>" +
+            "<h4 style='margin-bottom:6px; margin-top:14px; font-size:13px; color:#555;'>Live Feed (Last 10 Downloads)</h4>" +
+            "<div id='liveFeed' style='font-size:12px; font-family:monospace; background:#fff; border:1px solid #eee; padding:8px; height:140px; overflow-y:auto; border-radius:3px;'></div>";
+            
+        content.appendChild(dashboard);
 
-        function startWorker() {
-            while (currentIndex < pages.length && (currentIndex - completedCount) < maxConcurrency) {
-                (function(index) {
-                    var title = pages[index];
-                    currentIndex++;
+        var progressBar = document.getElementById("progressBar");
+        var dashTotal = document.getElementById("dashTotal");
+        var dashDownloaded = document.getElementById("dashDownloaded");
+        var dashActive = document.getElementById("dashActive");
+        var dashErrors = document.getElementById("dashErrors");
+        var liveFeed = document.getElementById("liveFeed");
 
-                    // Create light placeholder elements as they appear
-                    var pageElement = document.createElement("div");
-                    pageElement.className = "page";
-                    pageElement.id = "preview-" + index;
-                    pageElement.innerHTML = "<h3>" + escapeHTML(title) + "</h3><p class='loading'>Downloading...</p>";
-                    content.appendChild(pageElement);
+        dashTotal.textContent = pages.length;
 
-                    loadPage(title, function(err, html){
-                        completedCount++;
-
-                        var element = document.getElementById("preview-" + index);
-                        if (!err) {
-                            results[index] = {
-                                title: title,
-                                html: html
-                            };
-                            if (element) {
-                                element.innerHTML = "<h1>" + escapeHTML(title) + "</h1>" + html;
-                            }
-                        } else {
-                            results[index] = {
-                                title: title,
-                                html: "<p class='error'>Failed to download content.</p>"
-                            };
-                            if (element) {
-                                element.innerHTML = "<h1>" + escapeHTML(title) + "</h1><p class='error'>Failed to download content.</p>";
-                            }
-                        }
-
-                        updateStatus();
-
-                        if (completedCount === pages.length) {
-                            var finalResults = results.filter(function(r) { return r !== undefined; });
-                            buildEPUB(finalResults);
-                        } else {
-                            // Launch next task in queue
-                            startWorker();
-                        }
-                    });
-                })(currentIndex);
+        // Store a lightweight sliding array of the most recent 10 logs
+        var feedItems = [];
+        function pushToLiveFeed(title, status, index) {
+            var badgeClass = status === "DONE" ? "badge-success" : "badge-error";
+            var logHtml = "<div style='border-bottom:1px solid #f9f9f9; padding:2px 0; display:flex; justify-content:space-between;'>" +
+                "<span><strong>#" + (index + 1) + "</strong> " + escapeHTML(title) + "</span>" +
+                "<span class='status-badge " + badgeClass + "'>" + status + "</span>" +
+                "</div>";
+            
+            feedItems.push(logHtml);
+            if (feedItems.length > 10) {
+                feedItems.shift(); // Keep only last 10
             }
+            liveFeed.innerHTML = feedItems.join("");
+            liveFeed.scrollTop = liveFeed.scrollHeight;
         }
 
-        updateStatus();
-        startWorker();
+        function updateUI() {
+            var percent = ((completedCount / pages.length) * 100).toFixed(1);
+            progressBar.style.width = percent + "%";
+            dashDownloaded.textContent = completedCount;
+            dashActive.textContent = Math.min(maxConcurrency, pages.length - completedCount);
+            dashErrors.textContent = errorCount;
+            
+            statusText.innerHTML = "Downloading pages: " + completedCount + " / " + pages.length;
+        }
 
+        logToConsole("Initializing execution loop with optimized O(1) DOM footprint...", "info");
+
+        // Execution loop runs dynamically without dynamic DOM bloat
+        function launchWorker() {
+            if (currentIndex >= pages.length) return;
+
+            var taskIndex = currentIndex++;
+            var title = pages[taskIndex];
+
+            loadPage(title, function(err, html) {
+                completedCount++;
+
+                if (!err) {
+                    results[taskIndex] = {
+                        title: title,
+                        html: html
+                    };
+                    pushToLiveFeed(title, "DONE", taskIndex);
+                } else {
+                    errorCount++;
+                    results[taskIndex] = {
+                        title: title,
+                        html: "<p class='error'>Failed to download content.</p>"
+                    };
+                    pushToLiveFeed(title, "FAILED", taskIndex);
+                }
+
+                // Batch UI updates every few completions to completely avoid paint overhead
+                if (completedCount % 5 === 0 || completedCount === pages.length) {
+                    updateUI();
+                }
+
+                if (completedCount % 100 === 0 || completedCount === pages.length) {
+                    logToConsole("Progress: " + completedCount + " / " + pages.length + " completed.", "info");
+                }
+
+                if (completedCount === pages.length) {
+                    updateUI();
+                    var finalResults = results.filter(function(r) { return r !== undefined; });
+                    logToConsole("All 100% downloads resolved. Compiling ebook archive structure...", "success");
+                    buildEPUB(finalResults);
+                } else {
+                    launchWorker();
+                }
+            });
+        }
+
+        // Boot-up initial optimized streams up to limit
+        var startingWorkersCount = Math.min(maxConcurrency, pages.length);
+        logToConsole("Spinning up " + startingWorkersCount + " parallel workers...", "info");
+        for (var w = 0; w < startingWorkersCount; w++) {
+            launchWorker();
+        }
+
+        updateUI();
     });
 
 }
@@ -553,7 +793,7 @@ downloadButton.onclick = function(){
     return false;
 
 };
-
+//]]>
 </script>
 
 </body>
