@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>test</title>
+
+<style>
+body{
+    background:white;
+    color:black;
+    font-family:serif;
+    margin:20px;
+    line-height:1.5;
+    font-size:18px;
+}
+
+button{
+    padding:8px 12px;
+    margin:4px;
+    font-size:18px;
+}
+
+table{
+    border-collapse:collapse;
+    width:100%;
+    display:block;
+    overflow:auto;
+    margin-top:10px;
+    margin-bottom:10px;
+}
+
+td, th{
+    border:1px solid black;
+    padding:4px;
+    vertical-align:top;
+}
+
+img{
+    display:none;
+}
+
+a{
+    color:blue;
+    text-decoration:underline;
+}
+
+.page{
+    margin-top:30px;
+    page-break-after:always;
+}
+
+.loading{
+    color:gray;
+}
+</style>
+
+<!-- JSZip -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+<!-- FileSaver -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+
+</head>
+<body>
+
+<h1>test</h1>
+
+<button id="downloadButton" type="button">
+run
+</button>
+
+<p id="status"></p>
+
+<div id="content"></div>
+
+<script>
+/*
+EPUB GENERATOR
+--------------
+Downloads every wiki page
+Formats them Kindle-style
+Builds a real EPUB file
+*/
+
+var API = "https://genshin-impact.fandom.com/api.php";
+
+var statusText = document.getElementById("status");
+var content = document.getElementById("content");
+var downloadButton = document.getElementById("downloadButton");
+
+/* =========================
+   AJAX
+========================= */
+
+function getJSON(url, callback){
+
+    var xhr = new XMLHttpRequest();
+
+    xhr.onreadystatechange = function(){
+
+        if(xhr.readyState === 4){
+
+            if(xhr.status >= 200 && xhr.status < 300){
+
+                try{
+                    callback(null, JSON.parse(xhr.responseText));
+                }catch(e){
+                    callback("JSON parse failed", null);
+                }
+
+            }else{
+                callback("HTTP Error " + xhr.status, null);
+            }
+
+        }
+
+    };
+
+    xhr.open("GET", url, true);
+    xhr.send(null);
+
+}
+
+/* =========================
+   CLEAN PAGE
+========================= */
+
+function cleanPage(root){
+
+    removeBySelector(root, ".mw-editsection");
+    removeBySelector(root, ".toc");
+    removeBySelector(root, ".navbox");
+    removeBySelector(root, ".reflist");
+    removeBySelector(root, ".reference");
+    removeBySelector(root, "script");
+    removeBySelector(root, "style");
+    removeBySelector(root, ".portable-infobox");
+    removeBySelector(root, ".tabber");
+    removeBySelector(root, ".tabs");
+    removeBySelector(root, ".gallery");
+    removeBySelector(root, ".audio-button");
+    removeBySelector(root, ".nomobile");
+    removeBySelector(root, ".noprint");
+    removeBySelector(root, ".mw-parser-output > aside");
+
+    var images = root.getElementsByTagName("img");
+
+    while(images.length > 0){
+        images[0].parentNode.removeChild(images[0]);
+    }
+
+    var links = root.getElementsByTagName("a");
+
+    for(var i = 0; i < links.length; i++){
+
+        var href = links[i].getAttribute("href");
+
+        if(href && href.indexOf("/wiki/") === 0){
+
+            var pageName =
+                decodeURIComponent(
+                    href.replace("/wiki/", "")
+                ).replace(/_/g, " ");
+
+            links[i].setAttribute(
+                "href",
+                "#" + encodeURIComponent(pageName)
+            );
+
+        }
+
+    }
+
+}
+
+function removeBySelector(root, selector){
+
+    if(!root.querySelectorAll){
+        return;
+    }
+
+    var elements = root.querySelectorAll(selector);
+
+    for(var i = elements.length - 1; i >= 0; i--){
+
+        if(elements[i].parentNode){
+            elements[i].parentNode.removeChild(elements[i]);
+        }
+
+    }
+
+}
+
+/* =========================
+   GET ALL PAGE TITLES
+========================= */
+
+function getAllPages(callback){
+
+    var pages = [];
+
+    function loadBatch(apcontinue){
+
+        var url =
+            API +
+            "?origin=*" +
+            "&action=query" +
+            "&list=allpages" +
+            "&aplimit=500" +
+            "&format=json";
+
+        if(apcontinue){
+            url += "&apcontinue=" + encodeURIComponent(apcontinue);
+        }
+
+        getJSON(url, function(error, data){
+
+            if(error){
+                callback(error, null);
+                return;
+            }
+
+            if(data.query && data.query.allpages){
+
+                for(var i = 0; i < data.query.allpages.length; i++){
+                    pages.push(data.query.allpages[i].title);
+                }
+
+            }
+
+            statusText.innerHTML =
+                "Loaded page titles: " + pages.length;
+
+            if(data["continue"] && data["continue"].apcontinue){
+
+                loadBatch(data["continue"].apcontinue);
+
+            }else{
+
+                callback(null, pages);
+
+            }
+
+        });
+
+    }
+
+    loadBatch("");
+
+}
+
+/* =========================
+   LOAD PAGE HTML
+========================= */
+
+function loadPage(title, callback){
+
+    var url =
+        API +
+        "?origin=*" +
+        "&action=parse" +
+        "&page=" +
+        encodeURIComponent(title) +
+        "&prop=text" +
+        "&format=json";
+
+    getJSON(url, function(error, data){
+
+        if(error){
+            callback(error, null);
+            return;
+        }
+
+        if(!data.parse){
+            callback("Could not parse page", null);
+            return;
+        }
+
+        var html = data.parse.text["*"];
+
+        var temp = document.createElement("div");
+        temp.innerHTML = html;
+
+        cleanPage(temp);
+
+        callback(null, temp.innerHTML);
+
+    });
+
+}
+
+/* =========================
+   EPUB BUILD
+========================= */
+
+function buildEPUB(pagesData){
+
+    statusText.innerHTML = "Building EPUB...";
+
+    var zip = new JSZip();
+
+    /* Mimetype */
+    zip.file(
+        "mimetype",
+        "application/epub+zip",
+        {
+            compression: "STORE"
+        }
+    );
+
+    /* META-INF */
+    zip.folder("META-INF").file(
+        "container.xml",
+        '<?xml version="1.0"?>' +
+        '<container version="1.0" ' +
+        'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">' +
+        '<rootfiles>' +
+        '<rootfile full-path="OEBPS/content.opf" ' +
+        'media-type="application/oebps-package+xml"/>' +
+        '</rootfiles>' +
+        '</container>'
+    );
+
+    var oebps = zip.folder("OEBPS");
+
+    /* CSS */
+    oebps.file(
+        "style.css",
+        'body{font-family:serif;line-height:1.5;padding:1em;}' +
+        'table{border-collapse:collapse;width:100%;}' +
+        'td,th{border:1px solid black;padding:4px;}'
+    );
+
+    /* Chapters */
+    var manifest = '';
+    var spine = '';
+    var navPoints = '';
+
+    for(var i = 0; i < pagesData.length; i++){
+
+        var item = pagesData[i];
+
+        var fileName = "page" + i + ".xhtml";
+
+        var chapter =
+'<?xml version="1.0" encoding="utf-8"?>' +
+'<html xmlns="http://www.w3.org/1999/xhtml">' +
+'<head>' +
+'<title>' + escapeHTML(item.title) + '</title>' +
+'<link rel="stylesheet" type="text/css" href="style.css"/>' +
+'</head>' +
+'<body>' +
+'<h1 id="' + encodeURIComponent(item.title) + '">' +
+escapeHTML(item.title) +
+'</h1>' +
+item.html +
+'</body>' +
+'</html>';
+
+        oebps.file(fileName, chapter);
+
+        manifest +=
+            '<item id="item' + i + '" ' +
+            'href="' + fileName + '" ' +
+            'media-type="application/xhtml+xml"/>';
+
+        spine +=
+            '<itemref idref="item' + i + '"/>';
+
+        navPoints +=
+            '<navPoint id="navPoint-' + i + '" playOrder="' + (i+1) + '">' +
+            '<navLabel><text>' +
+            escapeHTML(item.title) +
+            '</text></navLabel>' +
+            '<content src="' + fileName + '"/>' +
+            '</navPoint>';
+
+    }
+
+    manifest +=
+        '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>' +
+        '<item id="css" href="style.css" media-type="text/css"/>';
+
+    /* content.opf */
+    oebps.file(
+        "content.opf",
+'<?xml version="1.0" encoding="utf-8"?>' +
+'<package version="2.0" xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId">' +
+'<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">' +
+'<dc:title>Genshin Impact Wiki</dc:title>' +
+'<dc:language>en</dc:language>' +
+'<dc:identifier id="BookId">genshinwiki</dc:identifier>' +
+'</metadata>' +
+'<manifest>' +
+manifest +
+'</manifest>' +
+'<spine toc="ncx">' +
+spine +
+'</spine>' +
+'</package>'
+    );
+
+    /* toc.ncx */
+    oebps.file(
+        "toc.ncx",
+'<?xml version="1.0" encoding="UTF-8"?>' +
+'<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">' +
+'<head>' +
+'<meta name="dtb:uid" content="genshinwiki"/>' +
+'</head>' +
+'<docTitle><text>Genshin Impact Wiki</text></docTitle>' +
+'<navMap>' +
+navPoints +
+'</navMap>' +
+'</ncx>'
+    );
+
+    zip.generateAsync({
+        type:"blob"
+    }).then(function(blob){
+
+        saveAs(blob, "Genshin_Impact_Wiki.epub");
+
+        statusText.innerHTML =
+            "Finished EPUB download.";
+
+    });
+
+}
+
+/* =========================
+   DOWNLOAD ENTIRE WIKI
+========================= */
+
+function downloadWiki(){
+
+    content.innerHTML = "";
+    statusText.innerHTML = "Loading wiki index...";
+
+    getAllPages(function(error, pages){
+
+        if(error){
+            statusText.innerHTML = error;
+            return;
+        }
+
+        var results = [];
+        var index = 0;
+
+        function nextPage(){
+
+            if(index >= pages.length){
+
+                buildEPUB(results);
+                return;
+
+            }
+
+            var title = pages[index];
+
+            statusText.innerHTML =
+                "Downloading page " +
+                (index + 1) +
+                " / " +
+                pages.length +
+                ": " +
+                escapeHTML(title);
+
+            loadPage(title, function(err, html){
+
+                if(!err){
+
+                    results.push({
+                        title:title,
+                        html:html
+                    });
+
+                }
+
+                index++;
+
+                setTimeout(nextPage, 100);
+
+            });
+
+        }
+
+        nextPage();
+
+    });
+
+}
+
+/* =========================
+   UTILS
+========================= */
+
+function escapeHTML(text){
+
+    return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+
+}
+
+/* =========================
+   BUTTON
+========================= */
+
+downloadButton.onclick = function(){
+
+    downloadWiki();
+
+    return false;
+
+};
+
+</script>
+
+</body>
+</html>
