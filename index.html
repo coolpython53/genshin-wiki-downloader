@@ -210,8 +210,8 @@ function getAllPages(callback){
 
                 statusText.innerHTML = "Loaded page titles: " + pages.length;
 
-                // Stop early for quick test configurations if needed, or get all
-                if(data["continue"] && data["continue"].apcontinue && pages.length < 3000){
+                // Load batches continuously until apcontinue is no longer returned
+                if(data["continue"] && data["continue"].apcontinue){
                     loadBatch(data["continue"].apcontinue);
                 } else {
                     callback(null, pages);
