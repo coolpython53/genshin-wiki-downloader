@@ -145,33 +145,66 @@ a{
     max-height: 300px;
     overflow-y: auto;
 }
+
+/* Print Utilities & PDF Layout Styling */
+.pdf-control-panel {
+    background: #f5f5f5;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 15px;
+    margin-bottom: 20px;
+}
+
+.pdf-article {
+    page-break-after: always;
+    break-after: page;
+    margin-bottom: 40px;
+}
+
+.pdf-article h1 {
+    font-size: 28px;
+    border-bottom: 2px solid #000;
+    padding-bottom: 8px;
+    margin-top: 0;
+}
+
+/* Hide control panels, logs, headers and options when printing */
+@media print {
+    body {
+        margin: 0;
+        font-size: 12pt;
+    }
+    h1, .console-container, .pdf-control-panel, #downloadButton, #status, #speedometer, #content-generator-ui {
+        display: none !important;
+    }
+    .pdf-article {
+        page-break-after: always;
+        break-after: page;
+    }
+}
 </style>
-
-<!-- JSZip -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-
-<!-- FileSaver -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
 
 </head>
 <body>
 
-<h1>test</h1>
+<div id="content-generator-ui">
+    <h1>test</h1>
 
-<button id="downloadButton" type="button">
-run
-</button>
+    <button id="downloadButton" type="button">
+    run
+    </button>
 
-<p id="status"></p>
-<div id="speedometer" class="speed-info"></div>
+    <p id="status"></p>
+    <div id="speedometer" class="speed-info"></div>
 
-<!-- Custom Logging Console -->
-<div class="console-container">
-    <div class="console-header">
-        <span>Console Logs</span>
-        <button id="clearConsoleBtn" style="font-size: 11px; padding: 2px 6px; margin: 0; background: #444; color: #fff; border: none; border-radius: 2px;">Clear</button>
+    <!-- Custom Logging Console -->
+    <div class="console-container">
+        <div class="console-header">
+            <span>Console Logs</span>
+            <button id="clearConsoleBtn" style="font-size: 11px; padding: 2px 6px; margin: 0; background: #444; color: #fff; border: none; border-radius: 2px;">Clear</button>
+        </div>
+        <div id="consoleLog" class="console-log"></div>
     </div>
-    <div id="consoleLog" class="console-log"></div>
 </div>
 
 <div id="content"></div>
@@ -179,11 +212,11 @@ run
 <script type="text/javascript">
 //<![CDATA[
 /*
-EPUB GENERATOR (FAST REWRITTEN VERSION)
+PDF GENERATOR (FAST REWRITTEN VERSION)
 ----------------------------------------
-Downloads wiki pages concurrently
+Downloads wiki pages concurrently inside a Web Worker
 Formats them Kindle-style
-Builds a real EPUB file
+Builds a beautifully structured printable PDF booklet
 */
 
 var API = "https://genshin-impact.fandom.com/api.php";
@@ -194,12 +227,161 @@ var content = document.getElementById("content");
 var downloadButton = document.getElementById("downloadButton");
 var consoleLog = document.getElementById("consoleLog");
 var clearConsoleBtn = document.getElementById("clearConsoleBtn");
+var contentGeneratorUi = document.getElementById("content-generator-ui");
 
 // Single global parser instance to prevent memory leaks and GC lag
 var globalDOMParser = new DOMParser();
 
-// Map of lowercased page title -> EPUB filename
+// Map of lowercased page title -> internal anchors
 var titleMap = {};
+
+// Source code for the background Web Worker task
+var workerBlobCode = `
+    var pages = [];
+    var maxConcurrency = 1000;
+    var API = "";
+    var completedCount = 0;
+    var errorCount = 0;
+    var queue = [];
+    var failedIndices = [];
+    var activeConnections = 0;
+
+    function log(message, logType) {
+        self.postMessage({ type: 'log', message: message, logType: logType || 'info' });
+    }
+
+    self.onmessage = function(e) {
+        var data = e.data;
+        if (data.type === 'start') {
+            pages = data.pages;
+            maxConcurrency = data.maxConcurrency;
+            API = data.API;
+            completedCount = 0;
+            errorCount = 0;
+            failedIndices = [];
+            queue = Array.from({ length: pages.length }, function(_, i) { return i; });
+            activeConnections = 0;
+
+            log("Background worker thread initialized. Concurrency cap: " + maxConcurrency, "info");
+            
+            var startingCount = Math.min(maxConcurrency, queue.length);
+            for (var w = 0; w < startingCount; w++) {
+                launchNext();
+            }
+        } else if (data.type === 'retry') {
+            log("Worker thread received retry instruction for " + failedIndices.length + " items.", "info");
+            queue = failedIndices.slice();
+            failedIndices = [];
+            errorCount = 0;
+            
+            // Adjust completedCount back so that progress represents correctly
+            completedCount = pages.length - queue.length;
+            
+            var startingCount = Math.min(maxConcurrency, queue.length);
+            for (var w = 0; w < startingCount; w++) {
+                launchNext();
+            }
+        }
+    };
+
+    function launchNext() {
+        if (queue.length === 0) {
+            if (activeConnections === 0) {
+                self.postMessage({
+                    type: 'complete',
+                    completedCount: completedCount,
+                    errorCount: errorCount,
+                    failedIndices: failedIndices
+                });
+            }
+            return;
+        }
+
+        var taskIndex = queue.shift();
+        var title = pages[taskIndex];
+        activeConnections++;
+
+        loadPageInWorker(title, taskIndex);
+    }
+
+    function loadPageInWorker(title, taskIndex, retries) {
+        if (typeof retries === 'undefined') retries = 3;
+
+        var url = API + "?origin=*" + "&action=parse" + "&page=" + encodeURIComponent(title) + "&prop=text" + "&format=json";
+        
+        var controller = new AbortController();
+        var timeoutId = setTimeout(function() {
+            controller.abort();
+        }, 12000);
+
+        fetch(url, { signal: controller.signal })
+            .then(function(res) {
+                clearTimeout(timeoutId);
+                if (res.status === 429 && retries > 0) {
+                    var delay = 1000 * (4 - retries);
+                    log("Rate limited (429) on '" + title + "'. Retrying in " + delay + "ms...", "warn");
+                    setTimeout(function() {
+                        loadPageInWorker(title, taskIndex, retries - 1);
+                    }, delay);
+                    return;
+                }
+                if (!res.ok) throw new Error("HTTP " + res.status);
+                return res.json();
+            })
+            .then(function(data) {
+                if (!data) return;
+                if (!data.parse) {
+                    throw new Error("Parse missing");
+                }
+                var html = data.parse.text["*"];
+                
+                completedCount++;
+                activeConnections--;
+
+                self.postMessage({
+                    type: 'page_done',
+                    index: taskIndex,
+                    title: title,
+                    html: html,
+                    completedCount: completedCount,
+                    errorCount: errorCount
+                });
+
+                launchNext();
+            })
+            .catch(function(err) {
+                clearTimeout(timeoutId);
+                var isTimeout = err.name === 'AbortError';
+                var errorMsg = isTimeout ? "Request timed out (12s)" : err.message;
+
+                if (retries > 0) {
+                    var retryDelay = isTimeout ? 500 : 1000;
+                    log("Error fetching '" + title + "' (" + errorMsg + "). Retrying in " + retryDelay + "ms...", "warn");
+                    setTimeout(function() {
+                        loadPageInWorker(title, taskIndex, retries - 1);
+                    }, retryDelay);
+                } else {
+                    completedCount++;
+                    errorCount++;
+                    activeConnections--;
+                    failedIndices.push(taskIndex);
+
+                    log("Failed permanently to load '" + title + "' (" + errorMsg + ")", "error");
+
+                    self.postMessage({
+                        type: 'page_failed',
+                        index: taskIndex,
+                        title: title,
+                        error: errorMsg,
+                        completedCount: completedCount,
+                        errorCount: errorCount
+                    });
+
+                    launchNext();
+                }
+            });
+    }
+`;
 
 /* =========================
    LOGGING CONSOLE UTILS
@@ -360,7 +542,7 @@ function cleanPage(root){
             if(titleMap && titleMap[lowerPageName]){
                 links[i].setAttribute(
                     "href",
-                    titleMap[lowerPageName] + hashPart
+                    "#" + titleMap[lowerPageName] + hashPart
                 );
             } else {
                 // If it doesn't exist locally, map to an absolute external web URL so the link remains functional
@@ -448,208 +630,168 @@ function getAllPages(callback){
 }
 
 /* =========================
-   LOAD PAGE HTML WITH RETRIES (High Concurrency Protection)
+   PDF PROGRESSIVE DOM ASSEMBLER (CRASH-PROOF SINGLE FILE COMPILATION)
 ========================= */
 
-function loadPage(title, callback, retries) {
-    if (typeof retries === 'undefined') retries = 3;
+function buildPDF(pagesData){
+    statusText.innerHTML = "Assembling book database...";
+    logToConsole("Starting Progressive PDF DOM Compiler. Processing all pages into one file safely...", "info");
+
+    // Hide download/generator workspace UI
+    contentGeneratorUi.style.display = "none";
+    content.innerHTML = "";
+
+    // 1. Build Compilation Dashboard with Assembly Loading Bar
+    var controlPanel = document.createElement("div");
+    controlPanel.className = "pdf-control-panel";
     
-    var url =
-        API +
-        "?origin=*" +
-        "&action=parse" +
-        "&page=" +
-        encodeURIComponent(title) +
-        "&prop=text" +
-        "&format=json";
+    var titleHeader = document.createElement("h2");
+    titleHeader.style.marginTop = "0";
+    titleHeader.textContent = "PDF Compiler Dashboard";
+    
+    var descText = document.createElement("p");
+    descText.innerHTML = "Compiling " + pagesData.length + " complex web pages into a single layout. To keep your browser fast, we are assembling files progressively in the background.";
+    
+    // Loading Bar DOM
+    var assemblyBarContainer = document.createElement("div");
+    assemblyBarContainer.id = "assemblyProgressContainer";
+    assemblyBarContainer.style.width = "100%";
+    assemblyBarContainer.style.background = "#e0e0e0";
+    assemblyBarContainer.style.height = "16px";
+    assemblyBarContainer.style.borderRadius = "8px";
+    assemblyBarContainer.style.overflow = "hidden";
+    assemblyBarContainer.style.marginBottom = "10px";
 
-    fetch(url)
-        .then(function(res) {
-            // Handle HTTP 429 Too Many Requests
-            if (res.status === 429 && retries > 0) {
-                var delay = 1000 * (4 - retries);
-                logToConsole("Rate limited (429) on '" + title + "'. Retrying in " + delay + "ms...", "warn");
-                setTimeout(function() {
-                    loadPage(title, callback, retries - 1);
-                }, delay);
-                return;
-            }
-            if (!res.ok) throw new Error("HTTP " + res.status);
-            return res.json();
-        })
-        .then(function(data) {
-            if (!data || !data.parse) {
-                throw new Error("Parse missing");
-            }
-            var html = data.parse.text["*"];
-            
-            // Clean content asynchronously using single global DOMParser to prevent memory fragmentation
-            var doc = globalDOMParser.parseFromString(html, "text/html");
-            var body = doc.body;
-            cleanPage(body);
-            
-            // Convert clean HTML DOM to strict, well-formed XHTML serialization
-            var serializer = new XMLSerializer();
-            var xhtmlBodyStr = serializer.serializeToString(body);
-            
-            callback(null, xhtmlBodyStr);
-        })
-        .catch(function(err) {
-            if (retries > 0) {
-                logToConsole("Error fetching '" + title + "' (" + err.message + "). Retrying...", "warn");
-                setTimeout(function() {
-                    loadPage(title, callback, retries - 1);
-                }, 1000);
-            } else {
-                logToConsole("Failed permanently to load '" + title + "'", "error");
-                callback(err.message, null);
-            }
-        });
-}
+    var assemblyBar = document.createElement("div");
+    assemblyBar.id = "assemblyProgressBar";
+    assemblyBar.style.width = "0%";
+    assemblyBar.style.background = "#2196f3"; // Blue color for assembly phase
+    assemblyBar.style.height = "100%";
+    assemblyBar.style.transition = "width 0.1s ease";
+    
+    assemblyBarContainer.appendChild(assemblyBar);
 
-/* =========================
-   EPUB BUILD
-========================= */
+    var assemblyStatus = document.createElement("div");
+    assemblyStatus.id = "assemblyStatusText";
+    assemblyStatus.style.fontFamily = "monospace";
+    assemblyStatus.style.fontSize = "14px";
+    assemblyStatus.style.color = "#333";
+    assemblyStatus.style.marginBottom = "15px";
+    assemblyStatus.textContent = "Initializing Progressive Renderer...";
 
-function buildEPUB(pagesData){
+    // Print Actions (initially hidden until 100% built)
+    var actionContainer = document.createElement("div");
+    actionContainer.id = "printActionButtons";
+    actionContainer.style.display = "none";
+    actionContainer.style.marginTop = "15px";
 
-    statusText.innerHTML = "Building EPUB...";
-    speedometer.innerHTML = "";
-    logToConsole("Initializing ZIP generation for " + pagesData.length + " documents...", "info");
+    var triggerPrintBtn = document.createElement("button");
+    triggerPrintBtn.textContent = "Open Print Dialogue / Save to PDF";
+    triggerPrintBtn.style.background = "#4caf50";
+    triggerPrintBtn.style.color = "white";
+    triggerPrintBtn.style.border = "none";
+    triggerPrintBtn.style.borderRadius = "3px";
+    triggerPrintBtn.style.padding = "10px 20px";
+    triggerPrintBtn.style.fontWeight = "bold";
+    triggerPrintBtn.style.marginRight = "10px";
 
-    var zip = new JSZip();
+    var restartBtn = document.createElement("button");
+    restartBtn.textContent = "Restart Generator";
+    restartBtn.style.background = "#f44336";
+    restartBtn.style.color = "white";
+    restartBtn.style.border = "none";
+    restartBtn.style.borderRadius = "3px";
+    restartBtn.style.padding = "10px 20px";
+    restartBtn.style.fontWeight = "bold";
 
-    /* Mimetype */
-    zip.file(
-        "mimetype",
-        "application/epub+zip",
-        {
-            compression: "STORE"
+    actionContainer.appendChild(triggerPrintBtn);
+    actionContainer.appendChild(restartBtn);
+
+    controlPanel.appendChild(titleHeader);
+    controlPanel.appendChild(descText);
+    controlPanel.appendChild(assemblyBarContainer);
+    controlPanel.appendChild(assemblyStatus);
+    controlPanel.appendChild(actionContainer);
+
+    content.appendChild(controlPanel);
+
+    // Structural Print Document Node
+    var bookContainer = document.createElement("div");
+    bookContainer.id = "printable-book-container";
+    content.appendChild(bookContainer);
+
+    // Setup action callbacks
+    triggerPrintBtn.onclick = function() {
+        window.print();
+    };
+
+    restartBtn.onclick = function() {
+        // Sweep container out of memory completely
+        content.innerHTML = "";
+        contentGeneratorUi.style.display = "block";
+        downloadButton.disabled = false;
+        statusText.innerHTML = "Generator ready.";
+    };
+
+    // 2. Start Progressive Micro-Task Loop (100 page chunks to allow Browser layout GC passes)
+    var currentIndex = 0;
+    var totalPages = pagesData.length;
+    var chunkSize = 100;
+
+    function processBatch() {
+        var limit = Math.min(currentIndex + chunkSize, totalPages);
+        var fragment = document.createDocumentFragment();
+
+        for (var i = currentIndex; i < limit; i++) {
+            var item = pagesData[i];
+            if (!item) continue;
+
+            var article = document.createElement("div");
+            article.className = "pdf-article";
+            article.id = "page-anchor-" + i;
+
+            var articleHeader = document.createElement("h1");
+            articleHeader.textContent = item.title;
+
+            var articleBody = document.createElement("div");
+            articleBody.innerHTML = item.html;
+
+            article.appendChild(articleHeader);
+            article.appendChild(articleBody);
+            fragment.appendChild(article);
         }
-    );
 
-    /* META-INF */
-    zip.folder("META-INF").file(
-        "container.xml",
-        '<?xml version="1.0"?>' +
-        '<container version="1.0" ' +
-        'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">' +
-        '<rootfiles>' +
-        '<rootfile full-path="OEBPS/content.opf" ' +
-        'media-type="application/oebps-package+xml"/>' +
-        '</rootfiles>' +
-        '</container>'
-    );
+        bookContainer.appendChild(fragment);
+        currentIndex = limit;
 
-    var oebps = zip.folder("OEBPS");
+        // Calculate and Update Compilation Loading Progress
+        var pct = ((currentIndex / totalPages) * 100).toFixed(1);
+        assemblyBar.style.width = pct + "%";
+        assemblyStatus.textContent = "Compiling document layout: " + currentIndex + " / " + totalPages + " pages processed (" + pct + "%)";
 
-    /* CSS */
-    oebps.file(
-        "style.css",
-        'body{font-family:serif;line-height:1.5;padding:1em;}' +
-        'table{border-collapse:collapse;width:100%;margin-top:10px;margin-bottom:10px;}' +
-        'td,th{border:1px solid black;padding:6px;vertical-align:top;}' +
-        'img{max-width:100%;height:auto;vertical-align:middle;display:inline-block;}'
-    );
+        if (currentIndex < totalPages) {
+            // Yield back execution thread temporarily so DOM layouts and garbage collectors can pass
+            setTimeout(processBatch, 15);
+        } else {
+            // Compilation completed perfectly!
+            assemblyStatus.textContent = "Compilation complete! Your unified book document is loaded and fully optimized.";
+            assemblyStatus.style.color = "green";
+            assemblyStatus.style.fontWeight = "bold";
+            assemblyBar.style.background = "#4caf50";
+            
+            actionContainer.style.display = "block";
+            logToConsole("Progressive assembly finished cleanly. All pages loaded into unified layout.", "success");
+            statusText.innerHTML = "Unified document compiled successfully.";
 
-    /* Chapters */
-    var manifest = '';
-    var spine = '';
-    var navPoints = '';
-
-    for(var i = 0; i < pagesData.length; i++){
-
-        var item = pagesData[i];
-        if(!item) continue;
-
-        var fileName = "page" + i + ".xhtml";
-
-        var chapter =
-'<?xml version="1.0" encoding="utf-8"?>' +
-'<html xmlns="http://www.w3.org/1999/xhtml">' +
-'<head>' +
-'<title>' + escapeHTML(item.title) + '</title>' +
-'<link rel="stylesheet" type="text/css" href="style.css"/>' +
-'</head>' +
-item.html + // Already wrapped in serialized <body>...</body> via XMLSerializer
-'</html>';
-
-        oebps.file(fileName, chapter);
-
-        manifest +=
-            '<item id="item' + i + '" ' +
-            'href="' + fileName + '" ' +
-            'media-type="application/xhtml+xml"/>';
-
-        spine +=
-            '<itemref idref="item' + i + '"/>';
-
-        navPoints +=
-            '<navPoint id="navPoint-' + i + '" playOrder="' + (i+1) + '">' +
-            '<navLabel><text>' +
-            escapeHTML(item.title) +
-            '</text></navLabel>' +
-            '<content src="' + fileName + '"/>' +
-            '</navPoint>';
-
+            // Trigger system print window cleanly
+            setTimeout(function() {
+                window.print();
+            }, 500);
+        }
     }
 
-    manifest +=
-        '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>' +
-        '<item id="css" href="style.css" media-type="text/css"/>';
-
-    /* content.opf */
-    oebps.file(
-        "content.opf",
-'<?xml version="1.0" encoding="utf-8"?>' +
-'<package version="2.0" xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId">' +
-'<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">' +
-'<dc:title>Genshin Impact Wiki</dc:title>' +
-'<dc:language>en</dc:language>' +
-'<dc:identifier id="BookId">genshinwiki</dc:identifier>' +
-'</metadata>' +
-'<manifest>' +
-manifest +
-'</manifest>' +
-'<spine toc="ncx">' +
-spine +
-'</spine>' +
-'</package>'
-    );
-
-    /* toc.ncx */
-    oebps.file(
-        "toc.ncx",
-'<?xml version="1.0" encoding="UTF-8"?>' +
-'<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">' +
-'<head>' +
-'<meta name="dtb:uid" content="genshinwiki"/>' +
-'</head>' +
-'<docTitle><text>Genshin Impact Wiki</text></docTitle>' +
-'<navMap>' +
-navPoints +
-'</navMap>' +
-'</ncx>'
-    );
-
-    logToConsole("Compressing and packing EPUB file... (this may take a few seconds)", "info");
-
-    zip.generateAsync({
-        type:"blob"
-    }).then(function(blob){
-
-        saveAs(blob, "Genshin_Impact_Wiki.epub");
-
-        statusText.innerHTML = "Finished EPUB download.";
-        downloadButton.disabled = false;
-        logToConsole("EPUB created successfully! Download started.", "success");
-
-    }).catch(function(e) {
-        logToConsole("EPUB compilation error: " + e.message, "error");
-        statusText.innerHTML = "Error generating EPUB.";
-        downloadButton.disabled = false;
-    });
-
+    // Trigger progressive assembly chain
+    processBatch();
 }
 
 /* =========================
@@ -677,34 +819,33 @@ function downloadWiki(){
         // Build the local page tracking map
         titleMap = {};
         for (var i = 0; i < pages.length; i++) {
-            titleMap[pages[i].toLowerCase().trim()] = "page" + i + ".xhtml";
+            // map clean titles directly to structural page anchors for PDF jumps
+            titleMap[pages[i].toLowerCase().trim()] = "page-anchor-" + i;
         }
-        logToConsole("Generated page-link translation table for EPUB cross-referencing.", "success");
+        logToConsole("Generated page-link translation table for PDF cross-referencing.", "success");
         
-        // Concurrency Tuning: 1000 simultaneous streams
+        // Create an unthrottled background Web Worker
+        var blob = new Blob([workerBlobCode], { type: 'application/javascript' });
+        var worker = new Worker(URL.createObjectURL(blob));
+        
+        // Concurrency Tuning: 1000 simultaneous background streams
         var maxConcurrency = 1000; 
         var completedCount = 0;
         var errorCount = 0;
         var failedIndices = [];
 
-        // Build active worker queue pool
-        var queue = [];
-        for (var i = 0; i < pages.length; i++) {
-            queue.push(i);
-        }
-
         var startTime = Date.now();
         var lastCompletedCount = 0;
         var lastReportTime = startTime;
 
-        // Speedometer loop
+        // Speedometer loop (throttling is fine for UI, worker runs background at full speed!)
         var speedInterval = setInterval(function() {
             var now = Date.now();
             var duration = (now - lastReportTime) / 1000;
             var processed = completedCount - lastCompletedCount;
             var rps = (processed / duration).toFixed(1);
             
-            speedometer.innerHTML = "Speed: " + rps + " pages/sec | Active Threads: " + Math.min(maxConcurrency, queue.length);
+            speedometer.innerHTML = "Speed: " + rps + " pages/sec | Background Streams active";
             
             lastReportTime = now;
             lastCompletedCount = completedCount;
@@ -736,7 +877,7 @@ function downloadWiki(){
             "</div>" +
             "<div id='retryControlsContainer' style='margin-top: 15px; display: none; padding-top: 10px; border-top: 1px solid #eee;'>" +
                 "<button id='retryFailedBtn' style='font-size:13px; padding:6px 12px; background:#f44336; color:white; border:none; border-radius:3px; cursor:pointer; font-weight:bold;'>Retry Failed Pages</button>" +
-                "<button id='forceBuildBtn' style='font-size:13px; padding:6px 12px; margin-left:10px; background:#4caf50; color:white; border:none; border-radius:3px; cursor:pointer; font-weight:bold;'>Build EPUB Anyway</button>" +
+                "<button id='forceBuildBtn' style='font-size:13px; padding:6px 12px; margin-left:10px; background:#4caf50; color:white; border:none; border-radius:3px; cursor:pointer; font-weight:bold;'>Build PDF Anyway</button>" +
             "</div>" +
             "<h4 style='margin-bottom:6px; margin-top:14px; font-size:13px; color:#555;'>Live Feed (Last 10 Downloads)</h4>" +
             "<div id='liveFeed' style='font-size:12px; font-family:monospace; background:#fff; border:1px solid #eee; padding:8px; height:140px; overflow-y:auto; border-radius:3px;'></div>";
@@ -776,104 +917,106 @@ function downloadWiki(){
             var percent = ((completedCount / pages.length) * 100).toFixed(1);
             progressBar.style.width = percent + "%";
             dashDownloaded.textContent = completedCount;
-            dashActive.textContent = Math.min(maxConcurrency, queue.length);
+            dashActive.textContent = Math.min(maxConcurrency, pages.length - completedCount);
             dashErrors.textContent = errorCount;
             
             statusText.innerHTML = "Downloading pages: " + completedCount + " / " + pages.length;
         }
 
-        logToConsole("Initializing execution loop with optimized O(1) DOM footprint...", "info");
+        // Web Worker communications listener
+        worker.onmessage = function(e) {
+            var data = e.data;
+            if (data.type === 'log') {
+                logToConsole(data.message, data.logType);
+            } else if (data.type === 'page_done') {
+                var taskIndex = data.index;
+                completedCount = data.completedCount;
+                errorCount = data.errorCount;
 
-        // Execution loop runs dynamically without dynamic DOM bloat
-        function launchWorker() {
-            if (queue.length === 0) return;
+                // Process DOM parsing, page cleaning, and serializing asynchronously on main thread
+                var doc = globalDOMParser.parseFromString(data.html, "text/html");
+                var body = doc.body;
+                cleanPage(body);
+                
+                var serializer = new XMLSerializer();
+                var xhtmlBodyStr = serializer.serializeToString(body);
 
-            var taskIndex = queue.shift();
-            var title = pages[taskIndex];
+                results[taskIndex] = {
+                    title: data.title,
+                    html: xhtmlBodyStr
+                };
 
-            loadPage(title, function(err, html) {
-                completedCount++;
-
-                if (!err) {
-                    results[taskIndex] = {
-                        title: title,
-                        html: html
-                    };
-                    pushToLiveFeed(title, "DONE", taskIndex);
-                } else {
-                    errorCount++;
-                    failedIndices.push(taskIndex);
-                    results[taskIndex] = {
-                        title: title,
-                        html: "<p class='error'>Failed to download content.</p>"
-                    };
-                    pushToLiveFeed(title, "FAILED", taskIndex);
-                }
-
-                // Batch UI updates every few completions to completely avoid paint overhead
+                pushToLiveFeed(data.title, "DONE", taskIndex);
+                
                 if (completedCount % 5 === 0 || completedCount === pages.length) {
                     updateUI();
                 }
+            } else if (data.type === 'page_failed') {
+                var taskIndex = data.index;
+                completedCount = data.completedCount;
+                errorCount = data.errorCount;
+                failedIndices.push(taskIndex);
 
-                if (completedCount % 100 === 0 || completedCount === pages.length) {
-                    logToConsole("Progress: " + completedCount + " / " + pages.length + " completed.", "info");
-                }
+                results[taskIndex] = {
+                    title: data.title,
+                    html: "<p class='error'>Failed to download content.</p>"
+                };
 
-                if (completedCount === pages.length) {
+                pushToLiveFeed(data.title, "FAILED", taskIndex);
+
+                if (completedCount % 5 === 0 || completedCount === pages.length) {
                     updateUI();
-                    
-                    if (errorCount > 0) {
-                        logToConsole("Finished downloading with " + errorCount + " unresolved failures.", "warn");
-                        statusText.innerHTML = "Downloads complete with some errors. Choose an action below:";
-                        retryFailedBtn.textContent = "Retry " + errorCount + " Failed Pages";
-                        retryControlsContainer.style.display = "block";
-                    } else {
-                        var finalResults = results.filter(function(r) { return r !== undefined; });
-                        logToConsole("All 100% downloads resolved. Compiling ebook archive structure...", "success");
-                        buildEPUB(finalResults);
-                    }
-                } else {
-                    launchWorker();
                 }
-            });
-        }
+            } else if (data.type === 'complete') {
+                updateUI();
+                clearInterval(speedInterval);
+                worker.terminate();
+
+                if (errorCount > 0) {
+                    logToConsole("Finished downloading with " + errorCount + " unresolved failures.", "warn");
+                    statusText.innerHTML = "Downloads complete with some errors. Choose an action below:";
+                    retryFailedBtn.textContent = "Retry " + errorCount + " Failed Pages";
+                    retryControlsContainer.style.display = "block";
+                } else {
+                    var finalResults = results.filter(function(r) { return r !== undefined; });
+                    logToConsole("All 100% downloads resolved. Generating printable book output...", "success");
+                    buildPDF(finalResults);
+                }
+            }
+        };
 
         // Retry logic setup
         retryFailedBtn.onclick = function() {
             retryControlsContainer.style.display = "none";
             logToConsole("Retrying " + failedIndices.length + " failed page downloads...", "info");
 
-            // Transfer failures back into the active processing queue
-            queue = failedIndices.slice();
-            
             // Re-adjust stats down to accommodate the re-queued items
-            completedCount -= failedIndices.length;
+            completedCount = pages.length - failedIndices.length;
             errorCount = 0;
             failedIndices = [];
 
             updateUI();
 
-            // Fire up parallel workers for the retry run
-            var startingRetryWorkers = Math.min(maxConcurrency, queue.length);
-            for (var w = 0; w < startingRetryWorkers; w++) {
-                launchWorker();
-            }
+            // Notify Worker to run retry process
+            worker.postMessage({ type: 'retry' });
         };
 
         // Proceed without retrying logic
         forceBuildBtn.onclick = function() {
             retryControlsContainer.style.display = "none";
+            worker.terminate();
             var finalResults = results.filter(function(r) { return r !== undefined; });
-            logToConsole("Forcing build. Compiling EPUB with placeholder blocks for missing pages...", "warn");
-            buildEPUB(finalResults);
+            logToConsole("Forcing build. Compiling PDF booklet with placeholder blocks for missing pages...", "warn");
+            buildPDF(finalResults);
         };
 
-        // Boot-up initial optimized streams up to limit
-        var startingWorkersCount = Math.min(maxConcurrency, queue.length);
-        logToConsole("Spinning up " + startingWorkersCount + " parallel workers...", "info");
-        for (var w = 0; w < startingWorkersCount; w++) {
-            launchWorker();
-        }
+        // Trigger start in Worker thread
+        worker.postMessage({
+            type: 'start',
+            pages: pages,
+            maxConcurrency: maxConcurrency,
+            API: API
+        });
 
         updateUI();
     });
