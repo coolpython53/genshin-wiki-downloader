@@ -896,6 +896,10 @@ function downloadWiki(){
         var consecutiveSuccesses = 0;
         var consecutiveFailures = 0;
 
+        // Circuit Breaker & Safety Cooldown Trackers
+        var isCooldownActive = false;
+        var recentFailuresCount = 0;
+
         var startTime = Date.now();
         var lastCompletedCount = 0;
         var lastReportTime = startTime;
@@ -907,7 +911,11 @@ function downloadWiki(){
             var processed = completedCount - lastCompletedCount;
             var rps = (processed / duration).toFixed(1);
             
-            speedometer.innerHTML = "Speed: " + rps + " pages/sec | Active streams: " + activeConnections + " | Concurrency Cap: " + maxConcurrency;
+            if (isCooldownActive) {
+                speedometer.innerHTML = "Speed: COOLDOWN ACTIVE (Circuit Breaker) | Active streams: " + activeConnections;
+            } else {
+                speedometer.innerHTML = "Speed: " + rps + " pages/sec | Active streams: " + activeConnections + " | Concurrency Cap: " + maxConcurrency;
+            }
             
             lastReportTime = now;
             lastCompletedCount = completedCount;
@@ -985,10 +993,30 @@ function downloadWiki(){
             statusText.innerHTML = "Downloading pages: " + completedCount + " / " + pages.length;
         }
 
+        function triggerCooldown() {
+            isCooldownActive = true;
+            var oldCap = maxConcurrency;
+            maxConcurrency = Math.max(5, Math.floor(maxConcurrency * 0.25)); // Cut down dramatically
+            logToConsole("[Circuit Breaker] High failure frequency detected. Pausing downloads for 6 seconds to let server connections cool down...", "warn");
+            
+            setTimeout(function() {
+                isCooldownActive = false;
+                recentFailuresCount = 0;
+                logToConsole("[Circuit Breaker] Cooldown complete. Resuming queue processing at safer limit (" + maxConcurrency + " channels).", "success");
+                fillWorkerPool();
+            }, 6000);
+        }
+
         function adjustAdaptiveConcurrency(isSuccess) {
             if (isSuccess) {
                 consecutiveFailures = 0;
                 consecutiveSuccesses++;
+                
+                // Slowly decay recent failures count on success streaks
+                if (consecutiveSuccesses % 10 === 0) {
+                    recentFailuresCount = Math.max(0, recentFailuresCount - 2);
+                }
+
                 if (consecutiveSuccesses >= 15) {
                     var oldVal = maxConcurrency;
                     maxConcurrency = Math.min(1000, maxConcurrency + 15);
@@ -1002,6 +1030,14 @@ function downloadWiki(){
             } else {
                 consecutiveSuccesses = 0;
                 consecutiveFailures++;
+                recentFailuresCount++;
+
+                // Trigger emergency pause if failures spike too fast
+                if (recentFailuresCount >= 15 && !isCooldownActive) {
+                    triggerCooldown();
+                    return;
+                }
+
                 if (consecutiveFailures >= 3) {
                     var oldVal = maxConcurrency;
                     maxConcurrency = Math.max(5, Math.floor(oldVal * 0.5));
@@ -1014,6 +1050,7 @@ function downloadWiki(){
         }
 
         function fillWorkerPool() {
+            if (isCooldownActive) return;
             while (activeConnections < maxConcurrency && nextQueueIndex < pages.length) {
                 launchWorker();
             }
@@ -1024,6 +1061,8 @@ function downloadWiki(){
         // Promise-based Queue processor. This loop continues executing at full speed 
         // in background/unfocused tabs since resolutions are independent of standard timer throttling.
         function launchWorker() {
+            if (isCooldownActive) return;
+
             if (nextQueueIndex >= pages.length) {
                 if (activeConnections === 0) {
                     onDownloadComplete();
