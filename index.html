@@ -210,12 +210,12 @@ a{
     <h1>test</h1>
 
     <div style="margin-bottom: 10px; font-family: sans-serif;">
-        <label for="concurrencyLimit" style="font-size: 16px;">Connections Speed limit: </label>
+        <label for="concurrencyLimit" style="font-size: 16px;">Initial Speed Limit: </label>
         <select id="concurrencyLimit">
-            <option value="1000" selected="selected">1000 Connections (Maximum Speed)</option>
+            <option value="1000">1000 Connections (Maximum Speed)</option>
             <option value="500">500 Connections (Super Fast)</option>
-            <option value="200">200 Connections (Fast)</option>
-            <option value="50">50 Connections (Safe Mode)</option>
+            <option value="200" selected="selected">200 Connections (Recommended Start)</option>
+            <option value="50">50 Connections (Safe Start)</option>
         </select>
         
         <button id="downloadButton" type="button">
@@ -884,13 +884,17 @@ function downloadWiki(){
         }
         logToConsole("Generated page-link translation table for PDF cross-referencing.", "success");
         
-        // Concurrency Limit selected by user dynamically
-        var maxConcurrency = parseInt(concurrencyLimitSelect.value) || 1000; 
+        // Concurrency Limits
+        var maxConcurrency = parseInt(concurrencyLimitSelect.value) || 200; 
         var completedCount = 0;
         var errorCount = 0;
         var failedIndices = [];
         var activeConnections = 0;
         var nextQueueIndex = 0;
+
+        // Adaptive Concurrency Trackers
+        var consecutiveSuccesses = 0;
+        var consecutiveFailures = 0;
 
         var startTime = Date.now();
         var lastCompletedCount = 0;
@@ -903,7 +907,7 @@ function downloadWiki(){
             var processed = completedCount - lastCompletedCount;
             var rps = (processed / duration).toFixed(1);
             
-            speedometer.innerHTML = "Speed: " + rps + " pages/sec | Active streams: " + activeConnections;
+            speedometer.innerHTML = "Speed: " + rps + " pages/sec | Active streams: " + activeConnections + " | Concurrency Cap: " + maxConcurrency;
             
             lastReportTime = now;
             lastCompletedCount = completedCount;
@@ -981,7 +985,41 @@ function downloadWiki(){
             statusText.innerHTML = "Downloading pages: " + completedCount + " / " + pages.length;
         }
 
-        logToConsole("Initializing execution loop using safe Promise microtask threads...", "info");
+        function adjustAdaptiveConcurrency(isSuccess) {
+            if (isSuccess) {
+                consecutiveFailures = 0;
+                consecutiveSuccesses++;
+                if (consecutiveSuccesses >= 15) {
+                    var oldVal = maxConcurrency;
+                    maxConcurrency = Math.min(1000, maxConcurrency + 15);
+                    consecutiveSuccesses = 0;
+                    if (maxConcurrency > oldVal) {
+                        logToConsole("Network stable. Accelerating connection pool to " + maxConcurrency + " channels.", "success");
+                        // Relaunch workers to fill newly added capacity immediately
+                        fillWorkerPool();
+                    }
+                }
+            } else {
+                consecutiveSuccesses = 0;
+                consecutiveFailures++;
+                if (consecutiveFailures >= 3) {
+                    var oldVal = maxConcurrency;
+                    maxConcurrency = Math.max(5, Math.floor(oldVal * 0.5));
+                    consecutiveFailures = 0;
+                    if (maxConcurrency < oldVal) {
+                        logToConsole("Network resistance encountered. Backing off speed limit to " + maxConcurrency + " channels.", "warn");
+                    }
+                }
+            }
+        }
+
+        function fillWorkerPool() {
+            while (activeConnections < maxConcurrency && nextQueueIndex < pages.length) {
+                launchWorker();
+            }
+        }
+
+        logToConsole("Initializing execution loop using safe adaptive Promise microtask threads...", "info");
 
         // Promise-based Queue processor. This loop continues executing at full speed 
         // in background/unfocused tabs since resolutions are independent of standard timer throttling.
@@ -1008,6 +1046,7 @@ function downloadWiki(){
                         html: html
                     };
                     pushToLiveFeed(title, "DONE", taskIndex);
+                    adjustAdaptiveConcurrency(true);
                 } else {
                     errorCount++;
                     failedIndices.push(taskIndex);
@@ -1016,6 +1055,7 @@ function downloadWiki(){
                         html: "<p class='error'>Failed to download content.</p>"
                     };
                     pushToLiveFeed(title, "FAILED", taskIndex);
+                    adjustAdaptiveConcurrency(false);
                 }
 
                 if (completedCount % 5 === 0 || completedCount === pages.length) {
@@ -1026,8 +1066,8 @@ function downloadWiki(){
                     logToConsole("Progress: " + completedCount + " / " + pages.length + " completed.", "info");
                 }
 
-                // Recursively chain next fetch immediately without setTimeout to prevent background throttling
-                launchWorker();
+                // Recursively chain next fetch dynamically to meet current limits
+                fillWorkerPool();
             });
         }
 
