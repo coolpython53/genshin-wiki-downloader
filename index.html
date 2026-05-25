@@ -28,6 +28,13 @@ button:disabled {
     cursor: not-allowed;
 }
 
+select {
+    padding: 8px;
+    font-size: 16px;
+    margin: 4px;
+    cursor: pointer;
+}
+
 table{
     border-collapse:collapse;
     width:100%;
@@ -202,9 +209,19 @@ a{
 <div id="content-generator-ui">
     <h1>test</h1>
 
-    <button id="downloadButton" type="button">
-    run
-    </button>
+    <div style="margin-bottom: 10px; font-family: sans-serif;">
+        <label for="concurrencyLimit" style="font-size: 16px;">Connections Speed limit: </label>
+        <select id="concurrencyLimit">
+            <option value="1000" selected="selected">1000 Connections (Maximum Speed)</option>
+            <option value="500">500 Connections (Super Fast)</option>
+            <option value="200">200 Connections (Fast)</option>
+            <option value="50">50 Connections (Safe Mode)</option>
+        </select>
+        
+        <button id="downloadButton" type="button">
+        run
+        </button>
+    </div>
 
     <p id="status"></p>
     <div id="speedometer" class="speed-info"></div>
@@ -226,7 +243,7 @@ a{
 /*
 PDF GENERATOR (FAST REWRITTEN VERSION)
 ----------------------------------------
-Downloads wiki pages concurrently inside a Web Worker
+Downloads wiki pages concurrently using unthrottled Promise chain microtasks
 Formats them Kindle-style
 Builds a beautifully structured printable PDF booklet
 */
@@ -240,160 +257,13 @@ var downloadButton = document.getElementById("downloadButton");
 var consoleLog = document.getElementById("consoleLog");
 var clearConsoleBtn = document.getElementById("clearConsoleBtn");
 var contentGeneratorUi = document.getElementById("content-generator-ui");
+var concurrencyLimitSelect = document.getElementById("concurrencyLimit");
 
 // Single global parser instance to prevent memory leaks and GC lag
 var globalDOMParser = new DOMParser();
 
 // Map of lowercased page title -> internal anchors
 var titleMap = {};
-
-// Source code for the background Web Worker task
-var workerBlobCode = `
-    var pages = [];
-    var maxConcurrency = 1000;
-    var API = "";
-    var completedCount = 0;
-    var errorCount = 0;
-    var queue = [];
-    var failedIndices = [];
-    var activeConnections = 0;
-
-    function log(message, logType) {
-        self.postMessage({ type: 'log', message: message, logType: logType || 'info' });
-    }
-
-    self.onmessage = function(e) {
-        var data = e.data;
-        if (data.type === 'start') {
-            pages = data.pages;
-            maxConcurrency = data.maxConcurrency;
-            API = data.API;
-            completedCount = 0;
-            errorCount = 0;
-            failedIndices = [];
-            queue = Array.from({ length: pages.length }, function(_, i) { return i; });
-            activeConnections = 0;
-
-            log("Background worker thread initialized. Concurrency cap: " + maxConcurrency, "info");
-            
-            var startingCount = Math.min(maxConcurrency, queue.length);
-            for (var w = 0; w < startingCount; w++) {
-                launchNext();
-            }
-        } else if (data.type === 'retry') {
-            log("Worker thread received retry instruction for " + failedIndices.length + " items.", "info");
-            queue = failedIndices.slice();
-            failedIndices = [];
-            errorCount = 0;
-            
-            // Adjust completedCount back so that progress represents correctly
-            completedCount = pages.length - queue.length;
-            
-            var startingCount = Math.min(maxConcurrency, queue.length);
-            for (var w = 0; w < startingCount; w++) {
-                launchNext();
-            }
-        }
-    };
-
-    function launchNext() {
-        if (queue.length === 0) {
-            if (activeConnections === 0) {
-                self.postMessage({
-                    type: 'complete',
-                    completedCount: completedCount,
-                    errorCount: errorCount,
-                    failedIndices: failedIndices
-                });
-            }
-            return;
-        }
-
-        var taskIndex = queue.shift();
-        var title = pages[taskIndex];
-        activeConnections++;
-
-        loadPageInWorker(title, taskIndex);
-    }
-
-    function loadPageInWorker(title, taskIndex, retries) {
-        if (typeof retries === 'undefined') retries = 3;
-
-        var url = API + "?origin=*" + "&action=parse" + "&page=" + encodeURIComponent(title) + "&prop=text" + "&format=json";
-        
-        var controller = new AbortController();
-        var timeoutId = setTimeout(function() {
-            controller.abort();
-        }, 12000);
-
-        fetch(url, { signal: controller.signal })
-            .then(function(res) {
-                clearTimeout(timeoutId);
-                if (res.status === 429 && retries > 0) {
-                    var delay = 1000 * (4 - retries);
-                    log("Rate limited (429) on '" + title + "'. Retrying in " + delay + "ms...", "warn");
-                    setTimeout(function() {
-                        loadPageInWorker(title, taskIndex, retries - 1);
-                    }, delay);
-                    return;
-                }
-                if (!res.ok) throw new Error("HTTP " + res.status);
-                return res.json();
-            })
-            .then(function(data) {
-                if (!data) return;
-                if (!data.parse) {
-                    throw new Error("Parse missing");
-                }
-                var html = data.parse.text["*"];
-                
-                completedCount++;
-                activeConnections--;
-
-                self.postMessage({
-                    type: 'page_done',
-                    index: taskIndex,
-                    title: title,
-                    html: html,
-                    completedCount: completedCount,
-                    errorCount: errorCount
-                });
-
-                launchNext();
-            })
-            .catch(function(err) {
-                clearTimeout(timeoutId);
-                var isTimeout = err.name === 'AbortError';
-                var errorMsg = isTimeout ? "Request timed out (12s)" : err.message;
-
-                if (retries > 0) {
-                    var retryDelay = isTimeout ? 500 : 1000;
-                    log("Error fetching '" + title + "' (" + errorMsg + "). Retrying in " + retryDelay + "ms...", "warn");
-                    setTimeout(function() {
-                        loadPageInWorker(title, taskIndex, retries - 1);
-                    }, retryDelay);
-                } else {
-                    completedCount++;
-                    errorCount++;
-                    activeConnections--;
-                    failedIndices.push(taskIndex);
-
-                    log("Failed permanently to load '" + title + "' (" + errorMsg + ")", "error");
-
-                    self.postMessage({
-                        type: 'page_failed',
-                        index: taskIndex,
-                        title: title,
-                        error: errorMsg,
-                        completedCount: completedCount,
-                        errorCount: errorCount
-                    });
-
-                    launchNext();
-                }
-            });
-    }
-`;
 
 /* =========================
    LOGGING CONSOLE UTILS
@@ -619,7 +489,10 @@ function getAllPages(callback){
         }
 
         fetch(url)
-            .then(function(res) { return res.json(); })
+            .then(function(res) { 
+                if(!res.ok) throw new Error("HTTP " + res.status);
+                return res.json(); 
+            })
             .then(function(data) {
                 if(data.query && data.query.allpages){
                     for(var i = 0; i < data.query.allpages.length; i++){
@@ -639,13 +512,92 @@ function getAllPages(callback){
                 }
             })
             .catch(function(err) {
-                logToConsole("Failed to load catalog index: " + err.message, "error");
+                logToConsole("Failed to load catalog index: " + err.message + " (Likely a network/CORS error)", "error");
                 callback(err.message, null);
             });
     }
 
     loadBatch("");
 
+}
+
+/* =========================
+   LOAD PAGE HTML WITH RETRIES & TIMEOUTS (Main Thread Safe)
+========================= */
+
+function loadPage(title, callback, retries) {
+    if (typeof retries === 'undefined') retries = 3;
+    
+    // Add custom identifier to help pass bot filters safely
+    var url =
+        API +
+        "?origin=*" +
+        "&action=parse" +
+        "&page=" + encodeURIComponent(title) +
+        "&prop=text" +
+        "&format=json" +
+        "&formatversion=2" +
+        "&api_user_agent=EPUBGenerator/2.0";
+
+    var controller = new AbortController();
+    var timeoutId = setTimeout(function() {
+        controller.abort();
+    }, 15000); // 15-second safety timeout
+
+    fetch(url, { signal: controller.signal })
+        .then(function(res) {
+            clearTimeout(timeoutId);
+            // Handle HTTP 429 Too Many Requests (Rate limiting)
+            if (res.status === 429 && retries > 0) {
+                var delay = 2000 * (4 - retries);
+                logToConsole("Rate limited (429) on '" + title + "'. Retrying in " + delay + "ms...", "warn");
+                return new Promise(function(resolve) {
+                    setTimeout(function() {
+                        resolve(loadPage(title, callback, retries - 1));
+                    }, delay);
+                });
+            }
+            if (!res.ok) throw new Error("HTTP Status " + res.status);
+            return res.json();
+        })
+        .then(function(data) {
+            if (!data) return;
+            if (data.error) {
+                throw new Error(data.error.info || "API Error");
+            }
+            var html = data.parse.text;
+            if (!html) {
+                throw new Error("Parsed content empty");
+            }
+            
+            // Dom processing on unthrottled thread
+            var doc = globalDOMParser.parseFromString(html, "text/html");
+            var body = doc.body;
+            cleanPage(body, false);
+            
+            var serializer = new XMLSerializer();
+            var xhtmlBodyStr = serializer.serializeToString(body);
+            
+            callback(null, xhtmlBodyStr);
+        })
+        .catch(function(err) {
+            clearTimeout(timeoutId);
+            var isTimeout = err.name === 'AbortError';
+            var errorMsg = isTimeout ? "Request Timeout (15s)" : err.message;
+
+            if (retries > 0) {
+                var retryDelay = isTimeout ? 1000 : 2000;
+                logToConsole("Failed to fetch '" + title + "' (" + errorMsg + "). Retrying...", "warn");
+                return new Promise(function(resolve) {
+                    setTimeout(function() {
+                        resolve(loadPage(title, callback, retries - 1));
+                    }, retryDelay);
+                });
+            } else {
+                logToConsole("Permanent error on '" + title + "': " + errorMsg, "error");
+                callback(errorMsg, null);
+            }
+        });
 }
 
 /* =========================
@@ -932,28 +884,26 @@ function downloadWiki(){
         }
         logToConsole("Generated page-link translation table for PDF cross-referencing.", "success");
         
-        // Create an unthrottled background Web Worker
-        var blob = new Blob([workerBlobCode], { type: 'application/javascript' });
-        var worker = new Worker(URL.createObjectURL(blob));
-        
-        // Concurrency Tuning: 1000 simultaneous background streams
-        var maxConcurrency = 1000; 
+        // Concurrency Limit selected by user dynamically
+        var maxConcurrency = parseInt(concurrencyLimitSelect.value) || 1000; 
         var completedCount = 0;
         var errorCount = 0;
         var failedIndices = [];
+        var activeConnections = 0;
+        var nextQueueIndex = 0;
 
         var startTime = Date.now();
         var lastCompletedCount = 0;
         var lastReportTime = startTime;
 
-        // Speedometer loop (throttling is fine for UI, worker runs background at full speed!)
+        // Speedometer loop (runs smoothly on microtask queue)
         var speedInterval = setInterval(function() {
             var now = Date.now();
             var duration = (now - lastReportTime) / 1000;
             var processed = completedCount - lastCompletedCount;
             var rps = (processed / duration).toFixed(1);
             
-            speedometer.innerHTML = "Speed: " + rps + " pages/sec | Background Streams active";
+            speedometer.innerHTML = "Speed: " + rps + " pages/sec | Active streams: " + activeConnections;
             
             lastReportTime = now;
             lastCompletedCount = completedCount;
@@ -1025,106 +975,126 @@ function downloadWiki(){
             var percent = ((completedCount / pages.length) * 100).toFixed(1);
             progressBar.style.width = percent + "%";
             dashDownloaded.textContent = completedCount;
-            dashActive.textContent = Math.min(maxConcurrency, pages.length - completedCount);
+            dashActive.textContent = activeConnections;
             dashErrors.textContent = errorCount;
             
             statusText.innerHTML = "Downloading pages: " + completedCount + " / " + pages.length;
         }
 
-        // Web Worker communications listener
-        worker.onmessage = function(e) {
-            var data = e.data;
-            if (data.type === 'log') {
-                logToConsole(data.message, data.logType);
-            } else if (data.type === 'page_done') {
-                var taskIndex = data.index;
-                completedCount = data.completedCount;
-                errorCount = data.errorCount;
+        logToConsole("Initializing execution loop using safe Promise microtask threads...", "info");
 
-                // Process DOM parsing, page cleaning, and serializing asynchronously on main thread
-                var doc = globalDOMParser.parseFromString(data.html, "text/html");
-                var body = doc.body;
-                cleanPage(body, false); // Keep images by default for live result caches
-                
-                var serializer = new XMLSerializer();
-                var xhtmlBodyStr = serializer.serializeToString(body);
-
-                results[taskIndex] = {
-                    title: data.title,
-                    html: xhtmlBodyStr
-                };
-
-                pushToLiveFeed(data.title, "DONE", taskIndex);
-                
-                if (completedCount % 5 === 0 || completedCount === pages.length) {
-                    updateUI();
+        // Promise-based Queue processor. This loop continues executing at full speed 
+        // in background/unfocused tabs since resolutions are independent of standard timer throttling.
+        function launchWorker() {
+            if (nextQueueIndex >= pages.length) {
+                if (activeConnections === 0) {
+                    onDownloadComplete();
                 }
-            } else if (data.type === 'page_failed') {
-                var taskIndex = data.index;
-                completedCount = data.completedCount;
-                errorCount = data.errorCount;
-                failedIndices.push(taskIndex);
-
-                results[taskIndex] = {
-                    title: data.title,
-                    html: "<p class='error'>Failed to download content.</p>"
-                };
-
-                pushToLiveFeed(data.title, "FAILED", taskIndex);
-
-                if (completedCount % 5 === 0 || completedCount === pages.length) {
-                    updateUI();
-                }
-            } else if (data.type === 'complete') {
-                updateUI();
-                clearInterval(speedInterval);
-                worker.terminate();
-
-                if (errorCount > 0) {
-                    logToConsole("Finished downloading with " + errorCount + " unresolved failures.", "warn");
-                    statusText.innerHTML = "Downloads complete with some errors. Choose an action below:";
-                    retryFailedBtn.textContent = "Retry " + errorCount + " Failed Pages";
-                    retryControlsContainer.style.display = "block";
-                } else {
-                    var finalResults = results.filter(function(r) { return r !== undefined; });
-                    logToConsole("All 100% downloads resolved. Generating printable book output...", "success");
-                    buildPDF(finalResults);
-                }
+                return;
             }
-        };
+
+            var taskIndex = nextQueueIndex++;
+            var title = pages[taskIndex];
+            activeConnections++;
+            updateUI();
+
+            loadPage(title, function(err, html) {
+                activeConnections--;
+                completedCount++;
+
+                if (!err) {
+                    results[taskIndex] = {
+                        title: title,
+                        html: html
+                    };
+                    pushToLiveFeed(title, "DONE", taskIndex);
+                } else {
+                    errorCount++;
+                    failedIndices.push(taskIndex);
+                    results[taskIndex] = {
+                        title: title,
+                        html: "<p class='error'>Failed to download content.</p>"
+                    };
+                    pushToLiveFeed(title, "FAILED", taskIndex);
+                }
+
+                if (completedCount % 5 === 0 || completedCount === pages.length) {
+                    updateUI();
+                }
+
+                if (completedCount % 100 === 0 || completedCount === pages.length) {
+                    logToConsole("Progress: " + completedCount + " / " + pages.length + " completed.", "info");
+                }
+
+                // Recursively chain next fetch immediately without setTimeout to prevent background throttling
+                launchWorker();
+            });
+        }
+
+        function onDownloadComplete() {
+            updateUI();
+            clearInterval(speedInterval);
+
+            if (errorCount > 0) {
+                logToConsole("Finished downloading with " + errorCount + " unresolved failures.", "warn");
+                statusText.innerHTML = "Downloads complete with some errors. Choose an action below:";
+                retryFailedBtn.textContent = "Retry " + errorCount + " Failed Pages";
+                retryControlsContainer.style.display = "block";
+            } else {
+                var finalResults = results.filter(function(r) { return r !== undefined; });
+                logToConsole("All 100% downloads resolved. Generating printable book output...", "success");
+                buildPDF(finalResults);
+            }
+        }
 
         // Retry logic setup
         retryFailedBtn.onclick = function() {
             retryControlsContainer.style.display = "none";
             logToConsole("Retrying " + failedIndices.length + " failed page downloads...", "info");
 
-            // Re-adjust stats down to accommodate the re-queued items
-            completedCount = pages.length - failedIndices.length;
-            errorCount = 0;
+            var retryQueue = failedIndices.slice();
             failedIndices = [];
+            errorCount = 0;
+            completedCount = pages.length - retryQueue.length;
+            
+            // Set queue indices to target only retry items
+            var retryMap = {};
+            retryQueue.forEach(function(idx) {
+                retryMap[idx] = true;
+            });
+
+            nextQueueIndex = 0;
+            // Overwrite index tracker to process only failed items
+            pages = pages.filter(function(_, idx) {
+                return retryMap[idx];
+            });
+
+            // Adjust results database index map
+            results = new Array(pages.length);
 
             updateUI();
 
-            // Notify Worker to run retry process
-            worker.postMessage({ type: 'retry' });
+            // Relaunch the concurrent threads
+            var startingWorkers = Math.min(maxConcurrency, pages.length);
+            for (var w = 0; w < startingWorkers; w++) {
+                launchWorker();
+            }
         };
 
         // Proceed without retrying logic
         forceBuildBtn.onclick = function() {
             retryControlsContainer.style.display = "none";
-            worker.terminate();
             var finalResults = results.filter(function(r) { return r !== undefined; });
             logToConsole("Forcing build. Compiling PDF booklet with placeholder blocks for missing pages...", "warn");
             buildPDF(finalResults);
         };
 
-        // Trigger start in Worker thread
-        worker.postMessage({
-            type: 'start',
-            pages: pages,
-            maxConcurrency: maxConcurrency,
-            API: API
-        });
+        // Boot-up initial optimized streams up to limit
+        var startingWorkersCount = Math.min(maxConcurrency, pages.length);
+        logToConsole("Spinning up " + startingWorkersCount + " parallel safe request chains...", "info");
+        for (var w = 0; w < startingWorkersCount; w++) {
+            launchWorker();
+        }
 
         updateUI();
     });
