@@ -168,6 +168,18 @@ a{
     margin-top: 0;
 }
 
+/* Option layout */
+.panel-row {
+    margin: 10px 0;
+    font-family: sans-serif;
+    font-size: 15px;
+}
+
+.panel-row label {
+    margin-right: 15px;
+    cursor: pointer;
+}
+
 /* Hide control panels, logs, headers and options when printing */
 @media print {
     body {
@@ -418,7 +430,7 @@ clearConsoleBtn.onclick = function() {
    CLEAN PAGE
 ========================= */
 
-function cleanPage(root){
+function cleanPage(root, stripImages){
 
     // Extract real images out of <noscript> blocks first (common in Fandom responsive lazy-loaders)
     var noscripts = root.getElementsByTagName("noscript");
@@ -481,7 +493,7 @@ function cleanPage(root){
         img.removeAttribute("srcset");
         img.removeAttribute("data-srcset");
 
-        if (src) {
+        if (src && !stripImages) {
             // Check if it's a transparent 1x1 base64 lazy placeholder and fallback to data-src if available
             if (src.indexOf("data:image") === 0 && img.getAttribute("data-src")) {
                 src = img.getAttribute("data-src");
@@ -510,13 +522,20 @@ function cleanPage(root){
                 img.style.width = "auto";
                 img.style.marginRight = "4px";
             }
+        } else {
+            // If stripping images, remove element entirely
+            if (img.parentNode) {
+                img.parentNode.removeChild(img);
+            }
         }
 
         if (altText && altText !== "") {
             // Append a readable text label next to the image as a caption/backup descriptor
             var textNode = document.createTextNode(" " + altText + " ");
-            if (img.parentNode) {
+            if (img.parentNode && !stripImages) {
                 img.parentNode.insertBefore(textNode, img.nextSibling);
+            } else if (root.contains(img)) { // Fallback text placement if img is stripped
+                root.appendChild(textNode);
             }
         }
     }
@@ -630,18 +649,18 @@ function getAllPages(callback){
 }
 
 /* =========================
-   PDF PROGRESSIVE DOM ASSEMBLER (CRASH-PROOF SINGLE FILE COMPILATION)
+   PDF PROGRESSIVE DOM ASSEMBLER (CRASH-PROOF & HYPER-FAST)
 ========================= */
 
 function buildPDF(pagesData){
     statusText.innerHTML = "Assembling book database...";
-    logToConsole("Starting Progressive PDF DOM Compiler. Processing all pages into one file safely...", "info");
+    logToConsole("Starting Progressive PDF DOM Compiler.", "info");
 
     // Hide download/generator workspace UI
     contentGeneratorUi.style.display = "none";
     content.innerHTML = "";
 
-    // 1. Build Compilation Dashboard with Assembly Loading Bar
+    // 1. Build Compilation Dashboard with Assembly Loading Bar and Layout Speed-up Tools
     var controlPanel = document.createElement("div");
     controlPanel.className = "pdf-control-panel";
     
@@ -650,7 +669,40 @@ function buildPDF(pagesData){
     titleHeader.textContent = "PDF Compiler Dashboard";
     
     var descText = document.createElement("p");
-    descText.innerHTML = "Compiling " + pagesData.length + " complex web pages into a single layout. To keep your browser fast, we are assembling files progressively in the background.";
+    descText.innerHTML = "Because compiling " + pagesData.length + " pages into a single PDF exceeds normal browser memory limits, you can select range presets to generate <strong>instant volume PDFs</strong> below.";
+
+    // Volume Segmentation Controls (Allows split-second PDF compilations)
+    var setupBox = document.createElement("div");
+    setupBox.style.background = "#fff";
+    setupBox.style.padding = "12px";
+    setupBox.style.borderRadius = "4px";
+    setupBox.style.border = "1px solid #ddd";
+    setupBox.style.marginBottom = "15px";
+
+    setupBox.innerHTML = 
+        "<h4 style='margin-top:0; margin-bottom:8px; font-size:14px; text-transform:uppercase; color:#555;'>Speed Tuning Options</h4>" +
+        "<div class='panel-row'>" +
+            "<label><input type='checkbox' id='chkStripImages' checked='checked' /> Strip External Images (Recommended: Makes PDF generation 100x faster)</label>" +
+        "</div>" +
+        "<div class='panel-row'>" +
+            "<span>Select Range: </span>" +
+            "<select id='selVolumeRange' style='padding:4px; font-size:14px;'>" +
+                "<option value='0-1000'>Volume 1 (Pages 1 - 1,000)</option>" +
+                "<option value='1000-2000'>Volume 2 (Pages 1,001 - 2,000)</option>" +
+                "<option value='2000-5000'>Volume 3 (Pages 2,001 - 5,000)</option>" +
+                "<option value='0-5000'>Volume Max (Pages 1 - 5,000)</option>" +
+                "<option value='custom'>Custom Page Range...</option>" +
+            "</select>" +
+            "<span id='customRangeSpan' style='display:none; margin-left: 10px;'>" +
+                "Start Index: <input type='number' id='numStartRange' value='1' min='1' style='width:60px; padding:3px;' /> " +
+                "End Index: <input type='number' id='numEndRange' value='500' min='1' style='width:60px; padding:3px;' />" +
+            "</span>" +
+        "</div>" +
+        "<button id='btnStartAssembly' style='background:#2196f3; color:white; border:none; padding:8px 16px; font-size:14px; border-radius:3px; cursor:pointer; font-weight:bold; margin-top:5px;'>Apply & Start Compile</button>";
+
+    controlPanel.appendChild(titleHeader);
+    controlPanel.appendChild(descText);
+    controlPanel.appendChild(setupBox);
     
     // Loading Bar DOM
     var assemblyBarContainer = document.createElement("div");
@@ -661,11 +713,12 @@ function buildPDF(pagesData){
     assemblyBarContainer.style.borderRadius = "8px";
     assemblyBarContainer.style.overflow = "hidden";
     assemblyBarContainer.style.marginBottom = "10px";
+    assemblyBarContainer.style.display = "none"; // Shown when assembly starts
 
     var assemblyBar = document.createElement("div");
     assemblyBar.id = "assemblyProgressBar";
     assemblyBar.style.width = "0%";
-    assemblyBar.style.background = "#2196f3"; // Blue color for assembly phase
+    assemblyBar.style.background = "#2196f3";
     assemblyBar.style.height = "100%";
     assemblyBar.style.transition = "width 0.1s ease";
     
@@ -677,9 +730,10 @@ function buildPDF(pagesData){
     assemblyStatus.style.fontSize = "14px";
     assemblyStatus.style.color = "#333";
     assemblyStatus.style.marginBottom = "15px";
-    assemblyStatus.textContent = "Initializing Progressive Renderer...";
+    assemblyStatus.style.display = "none"; // Shown when assembly starts
+    assemblyStatus.textContent = "Waiting for compile range selection...";
 
-    // Print Actions (initially hidden until 100% built)
+    // Print Actions
     var actionContainer = document.createElement("div");
     actionContainer.id = "printActionButtons";
     actionContainer.style.display = "none";
@@ -707,18 +761,32 @@ function buildPDF(pagesData){
     actionContainer.appendChild(triggerPrintBtn);
     actionContainer.appendChild(restartBtn);
 
-    controlPanel.appendChild(titleHeader);
-    controlPanel.appendChild(descText);
     controlPanel.appendChild(assemblyBarContainer);
     controlPanel.appendChild(assemblyStatus);
     controlPanel.appendChild(actionContainer);
 
     content.appendChild(controlPanel);
 
-    // Structural Print Document Node
+    // Structural Print Document Container
     var bookContainer = document.createElement("div");
     bookContainer.id = "printable-book-container";
     content.appendChild(bookContainer);
+
+    // DOM selectors inside dashboard
+    var selVolumeRange = document.getElementById("selVolumeRange");
+    var customRangeSpan = document.getElementById("customRangeSpan");
+    var numStartRange = document.getElementById("numStartRange");
+    var numEndRange = document.getElementById("numEndRange");
+    var btnStartAssembly = document.getElementById("btnStartAssembly");
+    var chkStripImages = document.getElementById("chkStripImages");
+
+    selVolumeRange.onchange = function() {
+        if (selVolumeRange.value === "custom") {
+            customRangeSpan.style.display = "inline";
+        } else {
+            customRangeSpan.style.display = "none";
+        }
+    };
 
     // Setup action callbacks
     triggerPrintBtn.onclick = function() {
@@ -726,72 +794,112 @@ function buildPDF(pagesData){
     };
 
     restartBtn.onclick = function() {
-        // Sweep container out of memory completely
         content.innerHTML = "";
         contentGeneratorUi.style.display = "block";
         downloadButton.disabled = false;
         statusText.innerHTML = "Generator ready.";
     };
 
-    // 2. Start Progressive Micro-Task Loop (100 page chunks to allow Browser layout GC passes)
-    var currentIndex = 0;
-    var totalPages = pagesData.length;
-    var chunkSize = 100;
+    // Apply & Start Progressive Compilation Loop on custom selected Range
+    btnStartAssembly.onclick = function() {
+        // Parse range coordinates
+        var startIdx = 0;
+        var endIdx = pagesData.length;
+        var modeVal = selVolumeRange.value;
 
-    function processBatch() {
-        var limit = Math.min(currentIndex + chunkSize, totalPages);
-        var fragment = document.createDocumentFragment();
-
-        for (var i = currentIndex; i < limit; i++) {
-            var item = pagesData[i];
-            if (!item) continue;
-
-            var article = document.createElement("div");
-            article.className = "pdf-article";
-            article.id = "page-anchor-" + i;
-
-            var articleHeader = document.createElement("h1");
-            articleHeader.textContent = item.title;
-
-            var articleBody = document.createElement("div");
-            articleBody.innerHTML = item.html;
-
-            article.appendChild(articleHeader);
-            article.appendChild(articleBody);
-            fragment.appendChild(article);
-        }
-
-        bookContainer.appendChild(fragment);
-        currentIndex = limit;
-
-        // Calculate and Update Compilation Loading Progress
-        var pct = ((currentIndex / totalPages) * 100).toFixed(1);
-        assemblyBar.style.width = pct + "%";
-        assemblyStatus.textContent = "Compiling document layout: " + currentIndex + " / " + totalPages + " pages processed (" + pct + "%)";
-
-        if (currentIndex < totalPages) {
-            // Yield back execution thread temporarily so DOM layouts and garbage collectors can pass
-            setTimeout(processBatch, 15);
+        if (modeVal === "custom") {
+            startIdx = Math.max(0, parseInt(numStartRange.value) - 1);
+            endIdx = Math.min(pagesData.length, parseInt(numEndRange.value));
         } else {
-            // Compilation completed perfectly!
-            assemblyStatus.textContent = "Compilation complete! Your unified book document is loaded and fully optimized.";
-            assemblyStatus.style.color = "green";
-            assemblyStatus.style.fontWeight = "bold";
-            assemblyBar.style.background = "#4caf50";
-            
-            actionContainer.style.display = "block";
-            logToConsole("Progressive assembly finished cleanly. All pages loaded into unified layout.", "success");
-            statusText.innerHTML = "Unified document compiled successfully.";
-
-            // Trigger system print window cleanly
-            setTimeout(function() {
-                window.print();
-            }, 500);
+            var parts = modeVal.split("-");
+            startIdx = parseInt(parts[0]);
+            endIdx = Math.min(pagesData.length, parseInt(parts[1]));
         }
-    }
 
-    // Trigger progressive assembly chain
-    processBatch();
+        if (startIdx >= endIdx) {
+            alert("Error: Start range index cannot be equal to or greater than the end index.");
+            return;
+        }
+
+        var shouldStrip = chkStripImages.checked;
+
+        // Reset and show Compilation Progress Bars
+        bookContainer.innerHTML = "";
+        btnStartAssembly.disabled = true;
+        assemblyBarContainer.style.display = "block";
+        assemblyStatus.style.display = "block";
+        actionContainer.style.display = "none";
+
+        var currentIndex = startIdx;
+        var totalToProcess = endIdx - startIdx;
+        var chunkSize = 100;
+
+        logToConsole("Starting progressive range compilation [Pages " + (startIdx + 1) + " to " + endIdx + "].", "info");
+
+        function processBatch() {
+            var limit = Math.min(currentIndex + chunkSize, endIdx);
+            var fragment = document.createDocumentFragment();
+
+            for (var i = currentIndex; i < limit; i++) {
+                var item = pagesData[i];
+                if (!item) continue;
+
+                var article = document.createElement("div");
+                article.className = "pdf-article";
+                article.id = "page-anchor-" + i;
+
+                var articleHeader = document.createElement("h1");
+                articleHeader.textContent = item.title;
+
+                var articleBody = document.createElement("div");
+                
+                // Reprocess clean text layout if we strip images
+                if (shouldStrip) {
+                    var tempCleanContainer = document.createElement("div");
+                    tempCleanContainer.innerHTML = item.html;
+                    cleanPage(tempCleanContainer, true);
+                    articleBody.innerHTML = tempCleanContainer.innerHTML;
+                } else {
+                    articleBody.innerHTML = item.html;
+                }
+
+                article.appendChild(articleHeader);
+                article.appendChild(articleBody);
+                fragment.appendChild(article);
+            }
+
+            bookContainer.appendChild(fragment);
+            currentIndex = limit;
+
+            // Calculate progress ratios
+            var processed = currentIndex - startIdx;
+            var pct = ((processed / totalToProcess) * 100).toFixed(1);
+            assemblyBar.style.width = pct + "%";
+            assemblyStatus.textContent = "Compiling book volume: " + processed + " / " + totalToProcess + " pages parsed (" + pct + "%)";
+
+            if (currentIndex < endIdx) {
+                setTimeout(processBatch, 10);
+            } else {
+                // Compilation Complete
+                assemblyStatus.textContent = "Volume compilation complete! Ready to save to device.";
+                assemblyStatus.style.color = "green";
+                assemblyStatus.style.fontWeight = "bold";
+                assemblyBar.style.background = "#4caf50";
+                
+                actionContainer.style.display = "block";
+                btnStartAssembly.disabled = false;
+                logToConsole("Progressive assembly finished cleanly for selected volume.", "success");
+                statusText.innerHTML = "Document Volume ready.";
+
+                // Fire system print dialog automatically
+                setTimeout(function() {
+                    window.print();
+                }, 500);
+            }
+        }
+
+        processBatch();
+    };
 }
 
 /* =========================
@@ -936,7 +1044,7 @@ function downloadWiki(){
                 // Process DOM parsing, page cleaning, and serializing asynchronously on main thread
                 var doc = globalDOMParser.parseFromString(data.html, "text/html");
                 var body = doc.body;
-                cleanPage(body);
+                cleanPage(body, false); // Keep images by default for live result caches
                 
                 var serializer = new XMLSerializer();
                 var xhtmlBodyStr = serializer.serializeToString(body);
